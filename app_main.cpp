@@ -17,7 +17,7 @@
 
 #include "App/CliOptions.h"
 #include "App/ConfigManager.h"
-#include "App/DiceManager.h"
+#include "App/Runtime/PixelsRuntimeService.h"
 #include "Systemic/Pixels/PixelScanner.h"
 
 using namespace Systemic::Pixels;
@@ -309,15 +309,7 @@ namespace
 
     int runNormalMode(const CliOptions& options)
     {
-        PixelsConfig config;
         std::string error;
-        if (!ConfigManager::load("pixels.cfg", config, error))
-        {
-            logLine("Failed to load pixels.cfg: " + error + "\n");
-            logLine("Run with --setup to create pixels.cfg.\n");
-            return 1;
-        }
-
         auto runtimeLogger = [&options](const std::string& message)
         {
             if (!options.rollsOnlyLogs)
@@ -332,9 +324,15 @@ namespace
             }
         };
 
-        // Runtime manager keeps the connect/watchdog behavior for each configured die.
-        DiceManager manager(config.pixelIds, runtimeLogger);
-        manager.runUntilEnterPressed();
+        PixelsRuntimeService runtime(runtimeLogger);
+        if (!runtime.loadConfig("pixels.cfg", error))
+        {
+            logLine("Failed to load pixels.cfg: " + error + "\n");
+            logLine("Run with --setup to create pixels.cfg.\n");
+            return 1;
+        }
+
+        runtime.runUntilEnterPressed();
 
         logLine("\nBye!\n");
         return 0;

@@ -106,6 +106,7 @@
     <ClInclude Include="App\DieConnection.h" />
     <ClInclude Include="App\DiceManager.h" />
     <ClInclude Include="App\Runtime\RuntimeModels.h" />
+    <ClInclude Include="App\Runtime\PixelsRuntimeService.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Systemic\BluetoothLE\BleTypes.h" />
     <ClInclude Include="Systemic\BluetoothLE\BluetoothLE.h" />
@@ -133,6 +134,7 @@
     <ClCompile Include="App\ConfigManager.cpp" />
     <ClCompile Include="App\DieConnection.cpp" />
     <ClCompile Include="App\DiceManager.cpp" />
+    <ClCompile Include="App\Runtime\PixelsRuntimeService.cpp" />
     <ClCompile Include="app_main.cpp" />
     <ClCompile Include="BluetoothLE.cpp" />
     <ClCompile Include="ComHelper.cpp" />

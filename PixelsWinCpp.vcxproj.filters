@@ -47,6 +47,9 @@
     <ClInclude Include="App\Runtime\RuntimeModels.h">
       <Filter>Header Files\App</Filter>
     </ClInclude>
+    <ClInclude Include="App\Runtime\PixelsRuntimeService.h">
+      <Filter>Header Files\App</Filter>
+    </ClInclude>
     <ClInclude Include="pch.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -125,6 +128,9 @@
       <Filter>Source Files\App</Filter>
     </ClCompile>
     <ClCompile Include="App\DiceManager.cpp">
+      <Filter>Source Files\App</Filter>
+    </ClCompile>
+    <ClCompile Include="App\Runtime\PixelsRuntimeService.cpp">
       <Filter>Source Files\App</Filter>
     </ClCompile>
     <ClCompile Include="pch.cpp">
