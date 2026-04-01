@@ -105,6 +105,7 @@
     <ClInclude Include="App\ConfigManager.h" />
     <ClInclude Include="App\DieConnection.h" />
     <ClInclude Include="App\DiceManager.h" />
+    <ClInclude Include="App\Runtime\RuntimeModels.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Systemic\BluetoothLE\BleTypes.h" />
     <ClInclude Include="Systemic\BluetoothLE\BluetoothLE.h" />

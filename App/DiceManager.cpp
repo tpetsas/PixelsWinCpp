@@ -12,62 +12,54 @@
 using namespace Systemic::Pixels;
 using namespace std::chrono_literals;
 
-DiceManager::DiceManager(const std::vector<uint32_t>& targetPixelIds, Logger logger)
-    : logger_(std::move(logger))
+DiceManager::DiceManager(const std::vector<uint32_t>& targetPixelIds, Logger logger, StateObserver stateObserver)
+    : logger_(std::move(logger)),
+      stateObserver_(std::move(stateObserver))
 {
     for (size_t i = 0; i < targetPixelIds.size(); ++i)
     {
         const std::string label = "die " + std::to_string(i + 1);
-        dice_.emplace_back(std::make_unique<DieConnection>(targetPixelIds[i], label, logger_));
+        dice_.emplace_back(std::make_unique<DieConnection>(targetPixelIds[i], label, logger_, stateObserver_));
     }
 }
 
 DiceManager::~DiceManager()
 {
-    inputDone_ = true;
-
-    stopScanner();
-    for (auto& die : dice_)
-    {
-        die->shutdown();
-    }
-
-    if (watchdogThread_.joinable())
-    {
-        watchdogThread_.join();
-    }
-
-    if (pollerThread_.joinable())
-    {
-        pollerThread_.join();
-    }
-
+    stop();
     if (inputThread_.joinable())
     {
         inputThread_.join();
     }
 }
 
-void DiceManager::runUntilEnterPressed()
+void DiceManager::start()
 {
-    if (logger_)
+    if (running_)
     {
-        logger_("Scanning for configured Pixel dice...\nConfigured IDs: " + configuredDiceText() + "\nPress Enter to exit.");
+        return;
     }
+
+    inputDone_ = false;
+    stopScanRequested_ = false;
+    running_ = true;
 
     startScanner();
 
-    inputThread_ = std::thread([this]()
+    maintenanceThread_ = std::thread([this]()
     {
-        try
+        while (!inputDone_)
         {
-            std::string line;
-            std::getline(std::cin, line);
+            if (stopScanRequested_)
+            {
+                stopScanner();
+                stopScanRequested_ = false;
+                if (logger_)
+                {
+                    logger_("\nStopped scanning after selecting configured dice.");
+                }
+            }
+            std::this_thread::sleep_for(200ms);
         }
-        catch (...)
-        {
-        }
-        inputDone_ = true;
     });
 
     pollerThread_ = std::thread([this]()
@@ -127,25 +119,26 @@ void DiceManager::runUntilEnterPressed()
             }
         }
     });
+}
 
-    while (!inputDone_)
+void DiceManager::stop()
+{
+    if (!running_)
     {
-        if (stopScanRequested_)
-        {
-            stopScanner();
-            stopScanRequested_ = false;
-            if (logger_)
-            {
-                logger_("\nStopped scanning after selecting configured dice.");
-            }
-        }
-        std::this_thread::sleep_for(200ms);
+        return;
     }
+
+    inputDone_ = true;
 
     stopScanner();
     for (auto& die : dice_)
     {
         die->shutdown();
+    }
+
+    if (maintenanceThread_.joinable())
+    {
+        maintenanceThread_.join();
     }
 
     if (watchdogThread_.joinable())
@@ -158,10 +151,69 @@ void DiceManager::runUntilEnterPressed()
         pollerThread_.join();
     }
 
+    running_ = false;
+}
+
+bool DiceManager::isRunning() const
+{
+    return running_;
+}
+
+void DiceManager::runUntilEnterPressed()
+{
+    if (logger_)
+    {
+        logger_("Scanning for configured Pixel dice...\nConfigured IDs: " + configuredDiceText() + "\nPress Enter to exit.");
+    }
+
+    start();
+
     if (inputThread_.joinable())
     {
         inputThread_.join();
     }
+
+    inputThread_ = std::thread([this]()
+    {
+        try
+        {
+            std::string line;
+            std::getline(std::cin, line);
+        }
+        catch (...)
+        {
+        }
+        inputDone_ = true;
+    });
+
+    while (!inputDone_)
+    {
+        std::this_thread::sleep_for(200ms);
+    }
+
+    stop();
+
+    if (inputThread_.joinable())
+    {
+        inputThread_.join();
+    }
+}
+
+std::vector<DieStatusSnapshot> DiceManager::snapshotDice() const
+{
+    std::vector<DieStatusSnapshot> snapshots;
+    snapshots.reserve(dice_.size());
+    for (const auto& die : dice_)
+    {
+        snapshots.push_back(die->snapshot());
+    }
+    return snapshots;
+}
+
+bool DiceManager::isScanning() const
+{
+    std::lock_guard<std::mutex> lock(scannerMutex_);
+    return scanner_ != nullptr;
 }
 
 void DiceManager::startScanner()
@@ -190,12 +242,20 @@ void DiceManager::startScanner()
         }
     };
 
+    std::lock_guard<std::mutex> lock(scannerMutex_);
     scanner_ = std::make_unique<PixelScanner>(listener);
     scanner_->start();
+
+    if (stateObserver_)
+    {
+        stateObserver_();
+    }
 }
 
 void DiceManager::stopScanner()
 {
+    std::lock_guard<std::mutex> lock(scannerMutex_);
+
     if (!scanner_)
     {
         return;
@@ -210,6 +270,11 @@ void DiceManager::stopScanner()
     }
 
     scanner_.reset();
+
+    if (stateObserver_)
+    {
+        stateObserver_();
+    }
 }
 
 bool DiceManager::allDiceSelected() const

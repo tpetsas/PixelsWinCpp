@@ -93,6 +93,7 @@ public:
 
     void onRolled(std::shared_ptr<Pixel> /*pixel*/, int face) override
     {
+        owner_->markRollResult(face);
         owner_->log("Rolled on face " + std::to_string(face));
         owner_->markRollEvent();
     }
@@ -110,10 +111,11 @@ private:
     DieConnection* owner_;
 };
 
-DieConnection::DieConnection(uint32_t targetPixelId, std::string label, Logger logger)
+DieConnection::DieConnection(uint32_t targetPixelId, std::string label, Logger logger, StateObserver stateObserver)
     : targetPixelId_(targetPixelId),
       label_(std::move(label)),
       logger_(std::move(logger)),
+      stateObserver_(std::move(stateObserver)),
       delegate_(std::make_shared<Delegate>(this))
 {
 }
@@ -183,6 +185,8 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
     {
         startConnectThread();
     }
+
+    notifyStateChanged();
 
     return shouldConnect;
 }
@@ -274,6 +278,32 @@ bool DieConnection::isSelected() const
     return selected_;
 }
 
+DieStatusSnapshot DieConnection::snapshot() const
+{
+    DieStatusSnapshot snapshot;
+    snapshot.targetPixelId = targetPixelId_;
+    snapshot.label = label_;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot.selected = selected_;
+    snapshot.connecting = connecting_;
+    snapshot.connectedOnce = connectedOnce_;
+    snapshot.hasPixel = (pixel_ != nullptr);
+    snapshot.hasLastRoll = hasLastRoll_;
+    snapshot.lastRollFace = lastRollFace_;
+    snapshot.lastRollAt = lastRollAt_;
+
+    if (pixel_)
+    {
+        snapshot.status = pixel_->status();
+        snapshot.batteryLevel = pixel_->batteryLevel();
+        snapshot.currentFace = pixel_->currentFace();
+        snapshot.isCharging = pixel_->isCharging();
+    }
+
+    return snapshot;
+}
+
 uint32_t DieConnection::targetPixelId() const
 {
     return targetPixelId_;
@@ -357,6 +387,8 @@ bool DieConnection::reconnectPixel()
         lastRollEvent_ = lastAnyMessage_;
     }
 
+    notifyStateChanged();
+
     return ok;
 }
 
@@ -401,6 +433,8 @@ void DieConnection::startConnectThread()
             lastAnyMessage_ = std::chrono::steady_clock::now();
             lastRollEvent_ = lastAnyMessage_;
         }
+
+        notifyStateChanged();
     });
 }
 
@@ -417,6 +451,25 @@ void DieConnection::markRollEvent()
     lastAnyMessage_ = lastRollEvent_;
 }
 
+void DieConnection::markRollResult(int face)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        hasLastRoll_ = true;
+        lastRollFace_ = face;
+        lastRollAt_ = std::chrono::system_clock::now();
+    }
+    notifyStateChanged();
+}
+
+void DieConnection::notifyStateChanged() const
+{
+    if (stateObserver_)
+    {
+        stateObserver_();
+    }
+}
+
 std::string DieConnection::prefix() const
 {
     return "[" + label_ + "] ";
@@ -427,5 +480,14 @@ void DieConnection::log(const std::string& message) const
     if (logger_)
     {
         logger_("\n" + prefix() + message);
+    }
+
+    if (message.find("Status changed to") != std::string::npos ||
+        message.find("Battery level changed") != std::string::npos ||
+        message.find("Connecting...") != std::string::npos ||
+        message.find("Connected and ready") != std::string::npos ||
+        message.find("Connection error") != std::string::npos)
+    {
+        notifyStateChanged();
     }
 }

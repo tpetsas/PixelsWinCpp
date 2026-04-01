@@ -44,6 +44,9 @@
     <ClInclude Include="App\DiceManager.h">
       <Filter>Header Files\App</Filter>
     </ClInclude>
+    <ClInclude Include="App\Runtime\RuntimeModels.h">
+      <Filter>Header Files\App</Filter>
+    </ClInclude>
     <ClInclude Include="pch.h">
       <Filter>Header Files</Filter>
     </ClInclude>

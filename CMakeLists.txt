@@ -87,6 +87,7 @@ add_executable(Pixels
     App/ConfigManager.h
     App/DieConnection.h
     App/DiceManager.h
+    App/Runtime/RuntimeModels.h
 )
 
 target_link_libraries(Pixels PRIVATE PixelsLib)
