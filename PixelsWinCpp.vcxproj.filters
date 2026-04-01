@@ -21,11 +21,29 @@
     <Filter Include="Header Files\Systemic\Pixels">
       <UniqueIdentifier>{5e161244-01f1-4e91-bf84-4fcc5f195186}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\App">
+      <UniqueIdentifier>{1a6b773d-d338-4aa0-95b0-5ac16abf458f}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Source Files\Systemic">
       <UniqueIdentifier>{9443b4c1-3000-49b5-9749-c6517129a066}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\App">
+      <UniqueIdentifier>{4d98909e-763f-4bda-b5a1-cf6512125ec9}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="App\CliOptions.h">
+      <Filter>Header Files\App</Filter>
+    </ClInclude>
+    <ClInclude Include="App\ConfigManager.h">
+      <Filter>Header Files\App</Filter>
+    </ClInclude>
+    <ClInclude Include="App\DieConnection.h">
+      <Filter>Header Files\App</Filter>
+    </ClInclude>
+    <ClInclude Include="App\DiceManager.h">
+      <Filter>Header Files\App</Filter>
+    </ClInclude>
     <ClInclude Include="pch.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -91,10 +109,22 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pch.cpp">
+    <ClCompile Include="app_main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="main.cpp">
+    <ClCompile Include="App\CliOptions.cpp">
+      <Filter>Source Files\App</Filter>
+    </ClCompile>
+    <ClCompile Include="App\ConfigManager.cpp">
+      <Filter>Source Files\App</Filter>
+    </ClCompile>
+    <ClCompile Include="App\DieConnection.cpp">
+      <Filter>Source Files\App</Filter>
+    </ClCompile>
+    <ClCompile Include="App\DiceManager.cpp">
+      <Filter>Source Files\App</Filter>
+    </ClCompile>
+    <ClCompile Include="pch.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="BluetoothLE.cpp">
@@ -120,6 +150,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <None Include="main.cpp" />
     <None Include="PropertySheet.props" />
     <None Include="packages.config" />
     <None Include="README.md" />

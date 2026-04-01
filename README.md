@@ -42,6 +42,47 @@ See the library documentation [here](https://gamewithpixels.github.io/PixelsWinC
 
 Documentation generated with [Doxygen](https://www.doxygen.nl).
 
+## Example App Modes
+
+The built example app supports three modes:
+
+- `--list`: Scan and print nearby Pixels dice.
+- `--setup`: Scan, choose 1 or 2 dice, and save `pixels.cfg`.
+- no arguments: Load `pixels.cfg` and connect to the configured die/dice.
+- `--rolls-only`: In normal mode, print only roll result lines (minimal output).
+
+`pixels.cfg` is saved in the app working directory using this format:
+
+```ini
+version=1
+dice=0xAABBCCDD,0x11223344
+```
+
+### Quickstart
+
+1. Discover nearby dice:
+
+   ```powershell
+   Pixels.exe --list
+   ```
+
+2. Choose your active die/dice and save config:
+
+   ```powershell
+   Pixels.exe --setup
+   ```
+
+3. Run normally with the saved config:
+
+   ```powershell
+   Pixels.exe
+   ```
+
+### Entry Point Notes
+
+- `app_main.cpp` is the config-based multi-die example app entry point used by the current build.
+- `main.cpp` is kept as a simpler single-die sample/test entry point for quick reference.
+
 ## License
 
 MIT

@@ -77,15 +77,25 @@ target_link_libraries(PixelsLib PUBLIC
 )
 
 # Create the example executable
-add_executable(PixelsExample main.cpp)
+add_executable(Pixels
+    app_main.cpp
+    App/CliOptions.cpp
+    App/ConfigManager.cpp
+    App/DieConnection.cpp
+    App/DiceManager.cpp
+    App/CliOptions.h
+    App/ConfigManager.h
+    App/DieConnection.h
+    App/DiceManager.h
+)
 
-target_link_libraries(PixelsExample PRIVATE PixelsLib)
+target_link_libraries(Pixels PRIVATE PixelsLib)
 
 # Use precompiled header for example too
-target_precompile_headers(PixelsExample REUSE_FROM PixelsLib)
+target_precompile_headers(Pixels REUSE_FROM PixelsLib)
 
 # Compiler definitions for example
-target_compile_definitions(PixelsExample PRIVATE
+target_compile_definitions(Pixels PRIVATE
     WIN32_LEAN_AND_MEAN
     WINRT_LEAN_AND_MEAN
     NOMINMAX
@@ -93,7 +103,7 @@ target_compile_definitions(PixelsExample PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(PixelsExample PRIVATE
+    target_compile_options(Pixels PRIVATE
         /permissive-
         /bigobj
         /await
@@ -102,14 +112,14 @@ if(MSVC)
 endif()
 
 # Set output directories
-set_target_properties(PixelsLib PixelsExample PROPERTIES
+set_target_properties(PixelsLib Pixels PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
 
 # Install targets
-install(TARGETS PixelsLib PixelsExample
+install(TARGETS PixelsLib Pixels
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
@@ -126,5 +136,5 @@ message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "")
 message(STATUS "Targets:")
 message(STATUS "  - PixelsLib (static library)")
-message(STATUS "  - PixelsExample (test application)")
+message(STATUS "  - Pixels (test application)")
 message(STATUS "")
