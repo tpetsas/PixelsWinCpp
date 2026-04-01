@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "Systemic/Pixels/Pixel.h"
 
@@ -24,4 +25,5 @@ struct DieStatusSnapshot
     bool hasLastRoll = false;
     int lastRollFace = 0;
     std::chrono::system_clock::time_point lastRollAt{};
+    std::vector<int> recentRollFaces;
 };

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "App/Runtime/RuntimeModels.h"
 #include "Systemic/Pixels/Pixel.h"
@@ -73,6 +74,7 @@ private:
     bool hasLastRoll_ = false;
     int lastRollFace_ = 0;
     std::chrono::system_clock::time_point lastRollAt_{};
+    std::vector<int> recentRollFaces_;
 
     std::thread connectThread_;
 };

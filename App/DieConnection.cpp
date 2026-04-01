@@ -292,6 +292,7 @@ DieStatusSnapshot DieConnection::snapshot() const
     snapshot.hasLastRoll = hasLastRoll_;
     snapshot.lastRollFace = lastRollFace_;
     snapshot.lastRollAt = lastRollAt_;
+    snapshot.recentRollFaces = recentRollFaces_;
 
     if (pixel_)
     {
@@ -458,6 +459,11 @@ void DieConnection::markRollResult(int face)
         hasLastRoll_ = true;
         lastRollFace_ = face;
         lastRollAt_ = std::chrono::system_clock::now();
+        recentRollFaces_.push_back(face);
+        if (recentRollFaces_.size() > 8)
+        {
+            recentRollFaces_.erase(recentRollFaces_.begin());
+        }
     }
     notifyStateChanged();
 }

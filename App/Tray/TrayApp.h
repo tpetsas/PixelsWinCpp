@@ -29,6 +29,9 @@ private:
     LRESULT handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
     bool createMessageWindow();
+    bool createStatusWindow();
+    void showStatusWindow();
+    void updateStatusWindow();
     bool addTrayIcon();
     void removeTrayIcon();
     void refreshTooltip();
@@ -46,10 +49,15 @@ private:
     bool pickOpenPath(std::wstring& outPath) const;
     std::wstring configFolder() const;
     std::wstring exeFolder() const;
+    std::wstring buildStatusWindowText() const;
+    std::wstring formatDieMenuLine(const DieStatusSnapshot& die, int dieIndex) const;
 
     HINSTANCE instanceHandle_ = nullptr;
     HWND windowHandle_ = nullptr;
+    HWND statusWindowHandle_ = nullptr;
+    HWND statusTextHandle_ = nullptr;
     std::wstring windowClassName_ = L"PixelsTrayWindowClass";
+    std::wstring statusWindowClassName_ = L"PixelsTrayStatusWindowClass";
     std::wstring configPath_;
     UINT taskbarCreatedMessage_ = 0;
 

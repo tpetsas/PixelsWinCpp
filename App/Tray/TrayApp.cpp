@@ -68,6 +68,9 @@ TrayApp::~TrayApp()
         DestroyWindow(windowHandle_);
         windowHandle_ = nullptr;
     }
+
+    statusWindowHandle_ = nullptr;
+    statusTextHandle_ = nullptr;
 }
 
 bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPath)
@@ -77,6 +80,11 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
     taskbarCreatedMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
 
     if (!createMessageWindow())
+    {
+        return false;
+    }
+
+    if (!createStatusWindow())
     {
         return false;
     }
@@ -160,6 +168,7 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (wParam == kTooltipTimerId && stateDirty_)
         {
             refreshTooltip();
+            updateStatusWindow();
             stateDirty_ = false;
         }
         return 0;
@@ -169,8 +178,7 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case kTrayCallbackMsg:
         if (lParam == WM_LBUTTONDBLCLK)
         {
-            refreshTooltip();
-            MessageBoxW(hwnd, buildTooltipText().c_str(), L"Pixels Tray", MB_OK | MB_ICONINFORMATION);
+            showStatusWindow();
         }
         else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
         {
@@ -187,6 +195,13 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         removeTrayIcon();
         PostQuitMessage(0);
         return 0;
+    case WM_CLOSE:
+        if (hwnd == statusWindowHandle_)
+        {
+            ShowWindow(statusWindowHandle_, SW_HIDE);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -220,6 +235,78 @@ bool TrayApp::createMessageWindow()
         this);
 
     return windowHandle_ != nullptr;
+}
+
+bool TrayApp::createStatusWindow()
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = &TrayApp::windowProc;
+    wc.hInstance = instanceHandle_;
+    wc.lpszClassName = statusWindowClassName_.c_str();
+
+    if (!RegisterClassExW(&wc))
+    {
+        return false;
+    }
+
+    statusWindowHandle_ = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        statusWindowClassName_.c_str(),
+        L"Pixels Status",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        460,
+        320,
+        nullptr,
+        nullptr,
+        instanceHandle_,
+        this);
+
+    if (!statusWindowHandle_)
+    {
+        return false;
+    }
+
+    statusTextHandle_ = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"EDIT",
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+        10,
+        10,
+        420,
+        260,
+        statusWindowHandle_,
+        nullptr,
+        instanceHandle_,
+        nullptr);
+
+    return statusTextHandle_ != nullptr;
+}
+
+void TrayApp::showStatusWindow()
+{
+    if (!statusWindowHandle_)
+    {
+        return;
+    }
+
+    updateStatusWindow();
+    ShowWindow(statusWindowHandle_, SW_SHOWNORMAL);
+    SetForegroundWindow(statusWindowHandle_);
+}
+
+void TrayApp::updateStatusWindow()
+{
+    if (!statusWindowHandle_ || !statusTextHandle_)
+    {
+        return;
+    }
+
+    const std::wstring text = buildStatusWindowText();
+    SetWindowTextW(statusTextHandle_, text.c_str());
 }
 
 bool TrayApp::addTrayIcon()
@@ -322,12 +409,109 @@ std::wstring TrayApp::buildTooltipText() const
     return text;
 }
 
+std::wstring TrayApp::buildStatusWindowText() const
+{
+    std::wstringstream ss;
+    ss << L"Pixels Tray Status\r\n\r\n";
+
+    if (!runtime_)
+    {
+        ss << L"Runtime unavailable.";
+        return ss.str();
+    }
+
+    ss << L"Running: " << (runtime_->isRunning() ? L"yes" : L"no") << L"\r\n";
+    ss << L"Scanning: " << (runtime_->isScanning() ? L"yes" : L"no") << L"\r\n";
+    ss << L"Config: " << (configLoaded_ ? L"loaded" : L"missing/invalid") << L"\r\n\r\n";
+
+    const auto snapshots = runtime_->snapshotDice();
+    if (snapshots.empty())
+    {
+        ss << L"No configured dice found in runtime.";
+        return ss.str();
+    }
+
+    for (size_t i = 0; i < snapshots.size(); ++i)
+    {
+        const auto& die = snapshots[i];
+        ss << L"Die " << (i + 1) << L" (" << toWide(die.label) << L")\r\n";
+        ss << L"  Status: " << statusToWide(die.status) << L"\r\n";
+        ss << L"  Battery: " << die.batteryLevel << L"%" << (die.isCharging ? L" (charging)" : L"") << L"\r\n";
+        ss << L"  Current face: " << die.currentFace << L"\r\n";
+        if (die.hasLastRoll)
+        {
+            ss << L"  Last roll: " << die.lastRollFace << L"\r\n";
+        }
+        else
+        {
+            ss << L"  Last roll: n/a\r\n";
+        }
+
+        ss << L"  Recent rolls: ";
+        if (die.recentRollFaces.empty())
+        {
+            ss << L"n/a";
+        }
+        else
+        {
+            for (size_t r = 0; r < die.recentRollFaces.size(); ++r)
+            {
+                if (r > 0)
+                {
+                    ss << L", ";
+                }
+                ss << die.recentRollFaces[r];
+            }
+        }
+        ss << L"\r\n\r\n";
+    }
+
+    return ss.str();
+}
+
+std::wstring TrayApp::formatDieMenuLine(const DieStatusSnapshot& die, int dieIndex) const
+{
+    std::wstringstream ss;
+    ss << L"Die " << dieIndex << L": " << statusToWide(die.status)
+       << L", batt " << die.batteryLevel << L"%, face " << die.currentFace;
+    if (die.hasLastRoll)
+    {
+        ss << L", last " << die.lastRollFace;
+    }
+    return ss.str();
+}
+
 void TrayApp::showContextMenu()
 {
     HMENU menu = CreatePopupMenu();
     if (!menu)
     {
         return;
+    }
+
+    const auto snapshots = runtime_ ? runtime_->snapshotDice() : std::vector<DieStatusSnapshot>{};
+    if (!snapshots.empty())
+    {
+        for (size_t i = 0; i < snapshots.size(); ++i)
+        {
+            const auto& die = snapshots[i];
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, formatDieMenuLine(die, static_cast<int>(i + 1)).c_str());
+            if (!die.recentRollFaces.empty())
+            {
+                std::wstringstream rs;
+                rs << L"  Recent: ";
+                for (size_t r = 0; r < die.recentRollFaces.size(); ++r)
+                {
+                    if (r > 0)
+                    {
+                        rs << L", ";
+                    }
+                    rs << die.recentRollFaces[r];
+                }
+                AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, rs.str().c_str());
+            }
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
 
     AppendMenuW(menu, MF_STRING, IDM_TRAY_RESCAN, L"Rescan dice");
