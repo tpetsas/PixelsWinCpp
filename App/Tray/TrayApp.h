@@ -33,14 +33,29 @@ private:
     void removeTrayIcon();
     void refreshTooltip();
     std::wstring buildTooltipText() const;
+    void showContextMenu();
+    void handleCommand(UINT commandId);
+
+    void doRescan();
+    void doSetup();
+    void doExportConfig();
+    void doImportConfig();
+    void doOpenConfigFolder() const;
+
+    bool pickSavePath(std::wstring& outPath) const;
+    bool pickOpenPath(std::wstring& outPath) const;
+    std::wstring configFolder() const;
+    std::wstring exeFolder() const;
 
     HINSTANCE instanceHandle_ = nullptr;
     HWND windowHandle_ = nullptr;
     std::wstring windowClassName_ = L"PixelsTrayWindowClass";
     std::wstring configPath_;
+    UINT taskbarCreatedMessage_ = 0;
 
     NOTIFYICONDATAW trayIconData_{};
     bool trayIconAdded_ = false;
+    bool configLoaded_ = false;
 
     std::atomic<bool> stateDirty_ = true;
 

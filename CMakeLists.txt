@@ -79,6 +79,7 @@ target_link_libraries(PixelsLib PUBLIC
 # Create the example executable
 add_executable(Pixels
     app_main.cpp
+    pixels_resources.rc
     App/CliOptions.cpp
     App/ConfigManager.cpp
     App/DieConnection.cpp
@@ -146,6 +147,7 @@ message(STATUS "")
 # Native Win32 tray app that reuses the same runtime/core logic.
 add_executable(PixelsTray WIN32
     tray_main.cpp
+    pixels_resources.rc
     App/CliOptions.cpp
     App/ConfigManager.cpp
     App/DieConnection.cpp
@@ -161,7 +163,7 @@ add_executable(PixelsTray WIN32
     App/Tray/TrayApp.h
 )
 
-target_link_libraries(PixelsTray PRIVATE PixelsLib shell32)
+target_link_libraries(PixelsTray PRIVATE PixelsLib shell32 comdlg32)
 
 target_compile_definitions(PixelsTray PRIVATE
     WIN32_LEAN_AND_MEAN
