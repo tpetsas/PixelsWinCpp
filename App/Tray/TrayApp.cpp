@@ -8,10 +8,16 @@
 #include <commdlg.h>
 #include <shellapi.h>
 
+#include "App/ConfigManager.h"
 #include "App/Tray/TrayResources.h"
+#include "Systemic/Pixels/PixelScanner.h"
 
 namespace
 {
+    constexpr int kSetupListId = 3001;
+    constexpr int kSetupScanButtonId = 3002;
+    constexpr int kSetupSaveButtonId = 3003;
+
     std::string narrowAscii(const std::wstring& ws)
     {
         std::string out;
@@ -42,11 +48,6 @@ namespace
         }
     }
 
-    bool pathExists(const std::wstring& path)
-    {
-        const DWORD attrs = GetFileAttributesW(path.c_str());
-        return attrs != INVALID_FILE_ATTRIBUTES;
-    }
 }
 
 TrayApp::TrayApp()
@@ -55,6 +56,8 @@ TrayApp::TrayApp()
 
 TrayApp::~TrayApp()
 {
+    stopSetupScan();
+
     if (runtime_)
     {
         runtime_->stop();
@@ -69,8 +72,23 @@ TrayApp::~TrayApp()
         windowHandle_ = nullptr;
     }
 
+    if (statusWindowHandle_)
+    {
+        DestroyWindow(statusWindowHandle_);
+        statusWindowHandle_ = nullptr;
+    }
+
+    if (setupWindowHandle_)
+    {
+        DestroyWindow(setupWindowHandle_);
+        setupWindowHandle_ = nullptr;
+    }
+
     statusWindowHandle_ = nullptr;
     statusTextHandle_ = nullptr;
+    setupListHandle_ = nullptr;
+    setupScanButtonHandle_ = nullptr;
+    setupSaveButtonHandle_ = nullptr;
 }
 
 bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPath)
@@ -85,6 +103,11 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
     }
 
     if (!createStatusWindow())
+    {
+        return false;
+    }
+
+    if (!createSetupWindow())
     {
         return false;
     }
@@ -104,14 +127,13 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
     if (!configLoaded_)
     {
         std::wstring msg =
-            L"Pixels tray started, but no valid pixels.cfg was found.\n\n"
-            L"Next steps:\n"
-            L"1) Right-click tray icon\n"
-            L"2) Click 'Setup dice (CLI)'\n"
-            L"3) After setup completes, click 'Rescan dice'\n\n"
-            L"Config path:\n" + configPath_ +
-            L"\n\nDetails: " + toWide(error);
-        MessageBoxW(windowHandle_, msg.c_str(), L"Pixels Tray", MB_ICONWARNING | MB_OK);
+            L"No valid pixels.cfg was found.\n\n"
+            L"Let's set up your dice now.\n"
+            L"We will start scanning immediately.\n\n"
+            L"Tip: by default, the first two discovered dice are pre-selected; just click 'Save Setup'.\n\n"
+            L"Config path:\n" + configPath_;
+        MessageBoxW(windowHandle_, msg.c_str(), L"Pixels Tray - First Time Setup", MB_ICONINFORMATION | MB_OK);
+        showSetupWindow();
     }
     else if (!runtime_->start())
     {
@@ -173,7 +195,25 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         return 0;
     case WM_COMMAND:
+        if (hwnd == setupWindowHandle_)
+        {
+            const UINT commandId = LOWORD(wParam);
+            if (commandId == kSetupScanButtonId)
+            {
+                startSetupScan();
+                return 0;
+            }
+            if (commandId == kSetupSaveButtonId)
+            {
+                saveSetupSelection();
+                return 0;
+            }
+        }
+
         handleCommand(LOWORD(wParam));
+        return 0;
+    case kSetupRefreshMsg:
+        refreshSetupList();
         return 0;
     case kTrayCallbackMsg:
         if (lParam == WM_LBUTTONDBLCLK)
@@ -199,6 +239,12 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (hwnd == statusWindowHandle_)
         {
             ShowWindow(statusWindowHandle_, SW_HIDE);
+            return 0;
+        }
+        if (hwnd == setupWindowHandle_)
+        {
+            stopSetupScan();
+            ShowWindow(setupWindowHandle_, SW_HIDE);
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -286,6 +332,97 @@ bool TrayApp::createStatusWindow()
     return statusTextHandle_ != nullptr;
 }
 
+bool TrayApp::createSetupWindow()
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = &TrayApp::windowProc;
+    wc.hInstance = instanceHandle_;
+    wc.lpszClassName = setupWindowClassName_.c_str();
+
+    if (!RegisterClassExW(&wc))
+    {
+        return false;
+    }
+
+    setupWindowHandle_ = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        setupWindowClassName_.c_str(),
+        L"Pixels Setup",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        560,
+        420,
+        nullptr,
+        nullptr,
+        instanceHandle_,
+        this);
+
+    if (!setupWindowHandle_)
+    {
+        return false;
+    }
+
+    CreateWindowExW(
+        0,
+        L"STATIC",
+        L"Scan and select 1 or 2 dice, then click Save Setup:",
+        WS_CHILD | WS_VISIBLE,
+        12,
+        12,
+        520,
+        20,
+        setupWindowHandle_,
+        nullptr,
+        instanceHandle_,
+        nullptr);
+
+    setupListHandle_ = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"LISTBOX",
+        L"",
+        WS_CHILD | WS_VISIBLE | LBS_EXTENDEDSEL | WS_VSCROLL | LBS_NOTIFY,
+        12,
+        40,
+        520,
+        290,
+        setupWindowHandle_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSetupListId)),
+        instanceHandle_,
+        nullptr);
+
+    setupScanButtonHandle_ = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Scan",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        12,
+        340,
+        100,
+        30,
+        setupWindowHandle_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSetupScanButtonId)),
+        instanceHandle_,
+        nullptr);
+
+    setupSaveButtonHandle_ = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Save Setup",
+        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        122,
+        340,
+        120,
+        30,
+        setupWindowHandle_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSetupSaveButtonId)),
+        instanceHandle_,
+        nullptr);
+
+    return (setupListHandle_ != nullptr && setupScanButtonHandle_ != nullptr && setupSaveButtonHandle_ != nullptr);
+}
+
 void TrayApp::showStatusWindow()
 {
     if (!statusWindowHandle_)
@@ -296,6 +433,189 @@ void TrayApp::showStatusWindow()
     updateStatusWindow();
     ShowWindow(statusWindowHandle_, SW_SHOWNORMAL);
     SetForegroundWindow(statusWindowHandle_);
+}
+
+void TrayApp::showSetupWindow()
+{
+    if (!setupWindowHandle_)
+    {
+        return;
+    }
+
+    ShowWindow(setupWindowHandle_, SW_SHOWNORMAL);
+    SetForegroundWindow(setupWindowHandle_);
+    startSetupScan();
+}
+
+void TrayApp::startSetupScan()
+{
+    stopSetupScan();
+
+    {
+        std::lock_guard<std::mutex> lock(setupMutex_);
+        setupDiscoveredById_.clear();
+        setupListPixelIds_.clear();
+    }
+
+    if (setupListHandle_)
+    {
+        SendMessageW(setupListHandle_, LB_RESETCONTENT, 0, 0);
+    }
+
+    Systemic::Pixels::PixelScanner::ScannedPixelListener listener = [this](const std::shared_ptr<const Systemic::Pixels::ScannedPixel>& scannedPixel)
+    {
+        if (!scannedPixel)
+        {
+            return;
+        }
+
+        const uint32_t id = static_cast<uint32_t>(scannedPixel->pixelId());
+
+        {
+            std::lock_guard<std::mutex> lock(setupMutex_);
+            auto& die = setupDiscoveredById_[id];
+            die.pixelId = id;
+            die.name = scannedPixel->name();
+            die.rssi = scannedPixel->rssi();
+            die.battery = scannedPixel->batteryLevel();
+            die.face = scannedPixel->currentFace();
+        }
+
+        PostMessageW(windowHandle_, kSetupRefreshMsg, 0, 0);
+    };
+
+    setupScanner_ = std::make_unique<Systemic::Pixels::PixelScanner>(listener);
+    setupScanner_->start();
+}
+
+void TrayApp::stopSetupScan()
+{
+    if (!setupScanner_)
+    {
+        return;
+    }
+
+    try
+    {
+        setupScanner_->stop();
+    }
+    catch (...)
+    {
+    }
+    setupScanner_.reset();
+}
+
+void TrayApp::refreshSetupList()
+{
+    if (!setupListHandle_)
+    {
+        return;
+    }
+
+    std::vector<SetupDiscoveredDie> dice;
+    {
+        std::lock_guard<std::mutex> lock(setupMutex_);
+        dice.reserve(setupDiscoveredById_.size());
+        for (const auto& kvp : setupDiscoveredById_)
+        {
+            dice.push_back(kvp.second);
+        }
+    }
+
+    std::sort(dice.begin(), dice.end(), [](const SetupDiscoveredDie& a, const SetupDiscoveredDie& b)
+    {
+        return a.pixelId < b.pixelId;
+    });
+
+    SendMessageW(setupListHandle_, LB_RESETCONTENT, 0, 0);
+    setupListPixelIds_.clear();
+
+    for (const auto& die : dice)
+    {
+        std::wstringstream line;
+        line << L"0x" << std::hex << std::uppercase << die.pixelId << std::dec
+             << L"  name=" << die.name
+             << L"  rssi=" << die.rssi
+             << L"  battery=" << die.battery << L"%"
+             << L"  face=" << die.face;
+
+        SendMessageW(setupListHandle_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.str().c_str()));
+        setupListPixelIds_.push_back(die.pixelId);
+    }
+
+    // First-time friendly default: pre-select up to 2 discovered dice.
+    const size_t defaultSelected = std::min<size_t>(2, setupListPixelIds_.size());
+    for (size_t i = 0; i < defaultSelected; ++i)
+    {
+        SendMessageW(setupListHandle_, LB_SETSEL, TRUE, static_cast<LPARAM>(i));
+    }
+}
+
+void TrayApp::saveSetupSelection()
+{
+    if (!setupListHandle_)
+    {
+        return;
+    }
+
+    const int selectedCount = static_cast<int>(SendMessageW(setupListHandle_, LB_GETSELCOUNT, 0, 0));
+    if (selectedCount < 1 || selectedCount > 2)
+    {
+        MessageBoxW(setupWindowHandle_, L"Select exactly 1 or 2 dice.", L"Pixels Setup", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    std::vector<int> selectedIndices(static_cast<size_t>(selectedCount));
+    const int copied = static_cast<int>(SendMessageW(
+        setupListHandle_,
+        LB_GETSELITEMS,
+        static_cast<WPARAM>(selectedIndices.size()),
+        reinterpret_cast<LPARAM>(selectedIndices.data())));
+
+    if (copied != selectedCount)
+    {
+        MessageBoxW(setupWindowHandle_, L"Could not read selected items.", L"Pixels Setup", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    PixelsConfig cfg;
+    for (const int idx : selectedIndices)
+    {
+        if (idx < 0 || static_cast<size_t>(idx) >= setupListPixelIds_.size())
+        {
+            MessageBoxW(setupWindowHandle_, L"Invalid selection index.", L"Pixels Setup", MB_OK | MB_ICONERROR);
+            return;
+        }
+        cfg.pixelIds.push_back(setupListPixelIds_[static_cast<size_t>(idx)]);
+    }
+
+    std::string error;
+    if (!ConfigManager::save(narrowAscii(configPath_), cfg, error))
+    {
+        MessageBoxW(setupWindowHandle_, toWide("Failed to save pixels.cfg: " + error).c_str(), L"Pixels Setup", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    stopSetupScan();
+    ShowWindow(setupWindowHandle_, SW_HIDE);
+
+    runtime_->stop();
+    configLoaded_ = runtime_->loadConfig(narrowAscii(configPath_), error);
+    if (!configLoaded_)
+    {
+        MessageBoxW(windowHandle_, toWide("Saved, but failed to reload config: " + error).c_str(), L"Pixels Tray", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    if (!runtime_->start())
+    {
+        MessageBoxW(windowHandle_, L"Setup saved, but runtime failed to start.", L"Pixels Tray", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    stateDirty_ = true;
+    updateStatusWindow();
+    MessageBoxW(windowHandle_, L"Setup saved successfully and runtime restarted.", L"Pixels Tray", MB_OK | MB_ICONINFORMATION);
 }
 
 void TrayApp::updateStatusWindow()
@@ -515,7 +835,7 @@ void TrayApp::showContextMenu()
     }
 
     AppendMenuW(menu, MF_STRING, IDM_TRAY_RESCAN, L"Rescan dice");
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_SETUP, L"Setup dice (CLI)");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_SETUP, L"Setup dice");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_EXPORT_CFG, L"Export pixels.cfg");
     AppendMenuW(menu, MF_STRING, IDM_TRAY_IMPORT_CFG, L"Import pixels.cfg");
@@ -585,27 +905,7 @@ void TrayApp::doRescan()
 
 void TrayApp::doSetup()
 {
-    const std::wstring cliPath = exeFolder() + L"\\Pixels.exe";
-    if (!pathExists(cliPath))
-    {
-        MessageBoxW(windowHandle_, L"Pixels.exe not found next to tray app.", L"Pixels Tray", MB_ICONERROR | MB_OK);
-        return;
-    }
-
-    std::wstring cmd = L"\"" + cliPath + L"\" --setup";
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, exeFolder().c_str(), &si, &pi))
-    {
-        MessageBoxW(windowHandle_, L"Failed to launch setup CLI.", L"Pixels Tray", MB_ICONERROR | MB_OK);
-        return;
-    }
-
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    MessageBoxW(windowHandle_, L"Setup launched in a new console. After saving config, click Rescan dice.", L"Pixels Tray", MB_ICONINFORMATION | MB_OK);
+    showSetupWindow();
 }
 
 void TrayApp::doExportConfig()
@@ -719,17 +1019,4 @@ std::wstring TrayApp::configFolder() const
         return L".";
     }
     return configPath_.substr(0, slash);
-}
-
-std::wstring TrayApp::exeFolder() const
-{
-    wchar_t modulePath[MAX_PATH * 4]{};
-    GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(_countof(modulePath)));
-    std::wstring fullPath = modulePath;
-    const size_t slash = fullPath.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-    {
-        return L".";
-    }
-    return fullPath.substr(0, slash);
 }
