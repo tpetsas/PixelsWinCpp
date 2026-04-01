@@ -1,226 +1,523 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <thread>
+#include <mutex>
+#include <future>
+#include <string>
+#include <chrono>
+#include <atomic>
+#include <exception>
+#include <cstdlib>
 
 #include "Systemic/Pixels/PixelScanner.h"
 #include "Systemic/Pixels/Pixel.h"
 
 using namespace Systemic::Pixels;
 using namespace Systemic::Pixels::Messages;
-
 using namespace std::chrono_literals;
-using std::to_string;
+
+// Change this to the die you want to test.
+constexpr uint32_t TARGET_PIXEL_ID = 0xbb55091c;
+
+std::mutex g_logMutex;
+
+void logLine(const std::string& s)
+{
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::cout << s << std::flush;
+}
+
+void installTerminateHandler()
+{
+    std::set_terminate([]()
+    {
+        try
+        {
+            auto eptr = std::current_exception();
+            if (eptr)
+            {
+                std::rethrow_exception(eptr);
+            }
+            logLine("\n[FATAL] std::terminate called with no current exception.\n");
+        }
+        catch (const std::exception& ex)
+        {
+            logLine(std::string("\n[FATAL] Unhandled exception: ") + ex.what() + "\n");
+        }
+        catch (...)
+        {
+            logLine("\n[FATAL] Unhandled non-standard exception.\n");
+        }
+        std::abort();
+    });
+}
 
 std::string to_string(PixelStatus status)
 {
     switch (status)
     {
-    case PixelStatus::Disconnected:
-        return "disconnected";
-    case PixelStatus::Connecting:
-        return "connecting";
-    case PixelStatus::Identifying:
-        return "identifying";
-    case PixelStatus::Ready:
-        return "ready";
-    case PixelStatus::Disconnecting:
-        return "disconnecting";
-    default:
-        return "";
+    case PixelStatus::Disconnected:  return "disconnected";
+    case PixelStatus::Connecting:    return "connecting";
+    case PixelStatus::Identifying:   return "identifying";
+    case PixelStatus::Ready:         return "ready";
+    case PixelStatus::Disconnecting: return "disconnecting";
+    default:                         return "unknown";
     }
 }
 
-std::string serializeTimePoint(const std::chrono::system_clock::time_point& time, const std::string& format);
-void printPixelMessage(std::shared_ptr<const PixelMessage> message);
-
-// Pixel delegate that output Pixel events to the console
-struct MyDelegate : PixelDelegate
+std::string serializeTimePoint(const std::chrono::system_clock::time_point& time, const std::string& format)
 {
-    virtual void onStatusChanged(std::shared_ptr<Pixel> pixel, PixelStatus status) override
-    {
-        std::cout << "\nStatus changed to " + to_string(status);
-    }
+    std::time_t tt = std::chrono::system_clock::to_time_t(time);
+    std::tm tm{};
+    localtime_s(&tm, &tt);
 
-    virtual void onFirmwareDateChanged(std::shared_ptr<Pixel> pixel, std::chrono::system_clock::time_point firmwareDate) override
-    {
-        std::cout << "\nFirmware date changed to " + serializeTimePoint(firmwareDate, "%Y-%m-%d %H:%M:%S");
-    }
+    std::stringstream ss;
+    ss << std::put_time(&tm, format.c_str());
+    return ss.str();
+}
 
-    virtual void onRssiChanged(std::shared_ptr<Pixel> pixel, int rssi) override
-    {
-        std::cout << "\nRSSI changed to " + to_string(rssi) + "dBm";
-    }
+struct SharedState
+{
+    std::mutex mutex;
+    std::shared_ptr<Pixel> pixel;
 
-    virtual void onBatteryLevelChanged(std::shared_ptr<Pixel> pixel, int batteryLevel) override
-    {
-        std::cout << "\nBattery level changed to " + to_string(batteryLevel) + "%";
-    }
+    bool shuttingDown = false;
+    bool connecting = false;
+    bool connectedOnce = false;
+    bool selected = false;
 
-    virtual void onChargingStateChanged(std::shared_ptr<Pixel> pixel, bool isCharging) override
-    {
-        std::cout << std::string{ "\nBattery is" } + (isCharging ? "" : " not") + " charging";
-    }
-
-    virtual void onRollStateChanged(std::shared_ptr<Pixel> pixel, PixelRollState state, int face) override
-    {
-        std::cout << "\nRoll state changed to " + to_string((int)state) + " with face " + to_string(face) + " up";
-    }
-
-    virtual void onRolled(std::shared_ptr<Pixel> pixel, int face) override
-    {
-        std::cout << "\nRolled on face " + to_string(face);
-    }
-
-    //virtual void onMessageReceived(std::shared_ptr<Pixel> pixel, std::shared_ptr<const PixelMessage> message) override
-    //{
-    //	printPixelMessage(message);
-    //}
+    std::chrono::steady_clock::time_point lastRollEvent = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastAnyMessage = std::chrono::steady_clock::now();
 };
 
-// Future that connects to a Pixels die and make it blink
-std::future<void> connectAndBlink(std::shared_ptr<Pixel> pixel)
+struct MyDelegate : PixelDelegate
 {
-    std::cout << "\nConnecting...";
+    SharedState* state = nullptr;
 
-    // Attempts to connect
+    explicit MyDelegate(SharedState* s) : state(s) {}
+
+    void markAnyMessage()
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->lastAnyMessage = std::chrono::steady_clock::now();
+    }
+
+    void markRollEvent()
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->lastRollEvent = std::chrono::steady_clock::now();
+        state->lastAnyMessage = state->lastRollEvent;
+    }
+
+    void onStatusChanged(std::shared_ptr<Pixel> /*pixel*/, PixelStatus status) override
+    {
+        logLine("\nStatus changed to " + to_string(status));
+        markAnyMessage();
+    }
+
+    void onFirmwareDateChanged(std::shared_ptr<Pixel> /*pixel*/, std::chrono::system_clock::time_point firmwareDate) override
+    {
+        logLine("\nFirmware date changed to " + serializeTimePoint(firmwareDate, "%Y-%m-%d %H:%M:%S"));
+        markAnyMessage();
+    }
+
+    void onRssiChanged(std::shared_ptr<Pixel> /*pixel*/, int rssi) override
+    {
+        logLine("\nRSSI changed to " + std::to_string(rssi) + "dBm");
+        markAnyMessage();
+    }
+
+    void onBatteryLevelChanged(std::shared_ptr<Pixel> /*pixel*/, int batteryLevel) override
+    {
+        logLine("\nBattery level changed to " + std::to_string(batteryLevel) + "%");
+        markAnyMessage();
+    }
+
+    void onChargingStateChanged(std::shared_ptr<Pixel> /*pixel*/, bool isCharging) override
+    {
+        logLine(std::string("\nBattery is") + (isCharging ? "" : " not") + " charging");
+        markAnyMessage();
+    }
+
+    void onRollStateChanged(std::shared_ptr<Pixel> /*pixel*/, PixelRollState stateValue, int face) override
+    {
+        logLine("\nRoll state changed to " + std::to_string((int)stateValue) + " with face " + std::to_string(face) + " up");
+        markRollEvent();
+    }
+
+    void onRolled(std::shared_ptr<Pixel> /*pixel*/, int face) override
+    {
+        logLine("\nRolled on face " + std::to_string(face));
+        markRollEvent();
+    }
+
+    void onMessageReceived(std::shared_ptr<Pixel> /*pixel*/, std::shared_ptr<const PixelMessage> message) override
+    {
+        if (message)
+        {
+            logLine("\n[raw] message type = " + std::string(getMessageName(message->type)));
+        }
+        markAnyMessage();
+    }
+};
+
+std::future<Pixel::ConnectResult> connectAndInitialize(std::shared_ptr<Pixel> pixel)
+{
+    logLine("\nConnecting...");
+
     auto result = co_await pixel->connectAsync();
-    // Check result
     if (result != Pixel::ConnectResult::Success)
     {
-        // If it failed, try a second time
+        logLine("\nFirst connection attempt failed, retrying...");
         result = co_await pixel->connectAsync();
     }
 
     if (result == Pixel::ConnectResult::Success)
     {
-        // We're connected!
-        std::cout << "\nConnected and ready to use!";
-
-        // Get RSSI notifications from die
-        co_await pixel->reportRssiAsync();
-
-        // Make die blink
-        co_await pixel->blinkAsync(3s, 0xFF0000, 3);
-
-        // Let's roll!
-        std::cout << "\nRoll die to see results...";
+        logLine("\nConnected and ready to use!");
+        logLine("\nRoll die to see results...");
     }
     else
     {
-        // Couldn't connect
-        std::cout << "\nConnection error: " + to_string((int)result);
+        logLine("\nConnection error: " + std::to_string((int)result));
     }
+
+    co_return result;
 }
 
-// Program entry point
+bool reconnectPixel(SharedState& state)
+{
+    std::shared_ptr<Pixel> localPixel;
+
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.shuttingDown || state.connecting || !state.pixel)
+        {
+            return false;
+        }
+        state.connecting = true;
+        localPixel = state.pixel;
+    }
+
+    logLine("\n[watchdog] Reconnecting...");
+
+    try
+    {
+        localPixel->disconnect();
+    }
+    catch (...)
+    {
+    }
+
+    bool ok = false;
+    try
+    {
+        const auto result = connectAndInitialize(localPixel).get();
+        ok = (result == Pixel::ConnectResult::Success);
+    }
+    catch (const std::exception& ex)
+    {
+        logLine(std::string("\n[watchdog] Reconnect exception: ") + ex.what());
+    }
+    catch (...)
+    {
+        logLine("\n[watchdog] Reconnect unknown exception.");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.connecting = false;
+        state.connectedOnce = ok;
+        state.lastAnyMessage = std::chrono::steady_clock::now();
+        state.lastRollEvent = state.lastAnyMessage;
+    }
+
+    return ok;
+}
+
 int main()
 {
+    installTerminateHandler();
     winrt::init_apartment();
 
-    // Shared states
-    std::mutex mutex{};
-    std::shared_ptr<Pixel> pixel{};
-    std::shared_ptr<MyDelegate> delegate{};
-    std::thread connectThread{};
+    SharedState state;
+    auto delegate = std::make_shared<MyDelegate>(&state);
 
-    // Print instructions
-    std::cout << "Scanning for Pixels dice...\n";
-    std::cout << "Once a Pixel is found, it will attempt to connect to it.\n";
-    std::cout << "Press any key to exit.\n";
+    std::stringstream header;
+    header << "Scanning for target Pixel die...\n";
+    header << "Target pixel id: 0x" << std::hex << TARGET_PIXEL_ID << std::dec << "\n";
+    header << "Press Enter to exit.\n";
+    logLine(header.str());
 
-    // Prepare scanner instance
-    PixelScanner scanner{ [&mutex, &pixel, &delegate, &connectThread](auto scannedPixel)
+    PixelScanner* scannerPtr = nullptr;
+    std::thread connectThread;
+
+    PixelScanner::ScannedPixelListener listener =
+        [&state, &delegate, &scannerPtr, &connectThread](const std::shared_ptr<const ScannedPixel>& scannedPixel)
         {
-            // We get notified each time the scanner gets advertisement data from a die
-
-            // Print scanned Pixel info
-            std::wcout << L"\nScanned Pixel: %ls" + scannedPixel->name();
-            std::stringstream ss{}; // Use stream to output text all at once so it's not cut by calls from another thread
-            ss << "\nId: " << std::hex << scannedPixel->pixelId() << std::dec;
-            ss << "\nRSSI: " << scannedPixel->rssi();
-            ss << "\nFirmware: " << serializeTimePoint(scannedPixel->firmwareDate(), "%Y-%m-%d %H:%M:%S");
-            ss << "\nRoll state: " << (int)scannedPixel->rollState();
-            ss << "\nCurrent face: " << (int)scannedPixel->currentFace();
-            ss << "\nBattery level: " << (int)scannedPixel->batteryLevel() << "%";
-            ss << "\nCharging: " << (scannedPixel->isCharging() ? "yes" : "no");
-            std::cout << ss.str();
-
-            // And connect to first Pixel it finds
+            if (!scannedPixel)
             {
-                std::lock_guard lock{ mutex };
-                if (!pixel)
-                {
-                    // Create delegate and Pixel
-                    delegate = std::shared_ptr<MyDelegate>{ new MyDelegate{} };
-                    pixel = Pixel::create(*scannedPixel, delegate);
+                return;
+            }
 
-                    // And connect to it on a new thread so to not block the scanner
-                    connectThread = std::thread([pixel]() { connectAndBlink(pixel).get(); });
+            const uint32_t id = (uint32_t)scannedPixel->pixelId();
+            if (id != TARGET_PIXEL_ID)
+            {
+                return;
+            }
+
+            bool shouldConnect = false;
+            bool firstSelection = false;
+
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+
+                if (state.shuttingDown || state.connecting)
+                {
+                    return;
+                }
+
+                if (!state.selected)
+                {
+                    state.selected = true;
+                    firstSelection = true;
+                }
+
+                if (!state.pixel)
+                {
+                    state.connecting = true;
+                    state.pixel = Pixel::create(*scannedPixel, delegate);
+                    state.lastAnyMessage = std::chrono::steady_clock::now();
+                    state.lastRollEvent = state.lastAnyMessage;
+                    shouldConnect = true;
+                }
+            }
+
+            if (!shouldConnect)
+            {
+                return;
+            }
+
+            if (firstSelection)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_logMutex);
+                    std::wcout << L"\nChosen Pixel: " << scannedPixel->name().c_str() << std::flush;
+                }
+
+                std::stringstream ss;
+                ss << "\nId: " << std::hex << id << std::dec;
+                ss << "\nRSSI: " << scannedPixel->rssi();
+                ss << "\nFirmware: " << serializeTimePoint(scannedPixel->firmwareDate(), "%Y-%m-%d %H:%M:%S");
+                ss << "\nRoll state: " << (int)scannedPixel->rollState();
+                ss << "\nCurrent face: " << (int)scannedPixel->currentFace();
+                ss << "\nBattery level: " << (int)scannedPixel->batteryLevel() << "%";
+                ss << "\nCharging: " << (scannedPixel->isCharging() ? "yes" : "no");
+                logLine(ss.str());
+            }
+
+            if (scannerPtr)
+            {
+                try
+                {
+                    scannerPtr->stop();
+                    logLine("\nStopped scanning after selecting target die.");
+                }
+                catch (...)
+                {
+                }
+            }
+
+            if (connectThread.joinable())
+            {
+                connectThread.join();
+            }
+
+            connectThread = std::thread([&state]()
+            {
+                bool ok = false;
+
+                try
+                {
+                    std::shared_ptr<Pixel> localPixel;
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        localPixel = state.pixel;
+                    }
+
+                    if (localPixel)
+                    {
+                        const auto result = connectAndInitialize(localPixel).get();
+                        ok = (result == Pixel::ConnectResult::Success);
+                    }
+                }
+                catch (const std::exception& ex)
+                {
+                    logLine(std::string("\nConnect thread exception: ") + ex.what());
+                }
+                catch (...)
+                {
+                    logLine("\nConnect thread unknown exception.");
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    state.connecting = false;
+                    state.connectedOnce = ok;
+                    state.lastAnyMessage = std::chrono::steady_clock::now();
+                    state.lastRollEvent = state.lastAnyMessage;
+                }
+            });
+        };
+
+    PixelScanner scanner(listener);
+    scannerPtr = &scanner;
+    scanner.start();
+
+    std::atomic<bool> inputDone = false;
+
+    std::thread inputThread([&]()
+    {
+        try
+        {
+            std::string line;
+            std::getline(std::cin, line);
+        }
+        catch (...)
+        {
+        }
+        inputDone = true;
+    });
+
+    std::thread poller([&state, &inputDone]()
+    {
+        try
+        {
+            while (!inputDone)
+            {
+                std::this_thread::sleep_for(5s);
+
+                std::shared_ptr<Pixel> localPixel;
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    localPixel = state.pixel;
+                }
+
+                if (localPixel)
+                {
+                    logLine("\n[poll] status=" + to_string(localPixel->status()) +
+                            ", face=" + std::to_string(localPixel->currentFace()) +
+                            ", rollState=" + std::to_string((int)localPixel->rollState()) +
+                            ", battery=" + std::to_string(localPixel->batteryLevel()));
                 }
             }
         }
-    };
+        catch (const std::exception& ex)
+        {
+            logLine(std::string("\nPoller exception: ") + ex.what());
+        }
+        catch (...)
+        {
+            logLine("\nPoller unknown exception.");
+        }
+    });
 
-    // Start scanning
-    scanner.start();
+    std::thread watchdog([&state, &inputDone]()
+    {
+        try
+        {
+            while (!inputDone)
+            {
+                std::this_thread::sleep_for(3s);
 
-    // Wait for user to press a key
-    std::system("pause");
-    std::cout << "\nBye!";
+                std::shared_ptr<Pixel> localPixel;
+                bool connecting = false;
+                bool connectedOnce = false;
+                PixelStatus currentStatus = PixelStatus::Disconnected;
+
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    connecting = state.connecting;
+                    connectedOnce = state.connectedOnce;
+                    localPixel = state.pixel;
+                    if (localPixel)
+                    {
+                        currentStatus = localPixel->status();
+                    }
+                }
+
+                if (!localPixel || connecting || !connectedOnce)
+                {
+                    continue;
+                }
+
+                if (currentStatus == PixelStatus::Disconnected)
+                {
+                    logLine("\n[watchdog] Detected disconnect.");
+                    reconnectPixel(state);
+                }
+            }
+        }
+        catch (const std::exception& ex)
+        {
+            logLine(std::string("\nWatchdog exception: ") + ex.what());
+        }
+        catch (...)
+        {
+            logLine("\nWatchdog unknown exception.");
+        }
+    });
+
+    while (!inputDone)
+    {
+        std::this_thread::sleep_for(200ms);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.shuttingDown = true;
+        if (state.pixel)
+        {
+            try
+            {
+                state.pixel->disconnect();
+            }
+            catch (...)
+            {
+            }
+        }
+    }
+
+    try
+    {
+        scanner.stop();
+    }
+    catch (...)
+    {
+    }
+
     if (connectThread.joinable())
     {
         connectThread.join();
     }
-}
 
-void printPixelMessage(std::shared_ptr<const PixelMessage> message)
-{
-    std::stringstream ss{};
-    switch (message->type)
+    if (watchdog.joinable())
     {
-    case MessageType::IAmADie: {
-        const auto m = static_cast<const IAmADie*>(message.get());
-        ss << "IAmADie => pixelId=" << std::hex << m->pixelId << std::dec
-            << ", ledCount=" << (int)m->ledCount
-            << ", battery=" << (int)m->batteryLevelPercent
-            << "%, rollState=" << (int)m->rollState
-            << ", face=" << ((int)m->currentFaceIndex + 1);
-    } break;
-    case MessageType::RollState: {
-        const auto m = static_cast<const RollState*>(message.get());
-        ss << "RollState => state=" << (int)m->state
-            << ", face=" << ((int)m->faceIndex + 1);
-    } break;
-    case MessageType::BatteryLevel: {
-        const auto m = static_cast<const BatteryLevel*>(message.get());
-        ss << "BatteryLevel => levelPercent=" << (int)m->levelPercent
-            << "%, state=" << (int)m->state;
-    } break;
-    case MessageType::Rssi: {
-        const auto m = static_cast<const Rssi*>(message.get());
-        ss << "RSSI => " << (int)m->value << " dBm";
-    } break;
-    default:
-        ss << "message => type=" << getMessageName(message->type);
+        watchdog.join();
     }
 
-    const auto s = ss.str();
-    if (!s.empty())
+    if (poller.joinable())
     {
-        std::cout << "\n>> Received message " + s;
+        poller.join();
     }
-}
 
-// https://stackoverflow.com/a/58523115
-std::string serializeTimePoint(const std::chrono::system_clock::time_point& time, const std::string& format)
-{
-    std::time_t tt = std::chrono::system_clock::to_time_t(time);
-    //std::tm tm = *std::gmtime(&tt); //GMT (UTC)
-    std::tm tm;
-    localtime_s(&tm, &tt); //Locale time-zone, usually UTC by default.
-    std::stringstream ss{};
-    ss << std::put_time(&tm, format.c_str());
-    return ss.str();
+    if (inputThread.joinable())
+    {
+        inputThread.join();
+    }
+
+    logLine("\nBye!\n");
+    return 0;
 }
