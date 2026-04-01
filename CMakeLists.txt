@@ -140,4 +140,50 @@ message(STATUS "")
 message(STATUS "Targets:")
 message(STATUS "  - PixelsLib (static library)")
 message(STATUS "  - Pixels (test application)")
+message(STATUS "  - PixelsTray (tray application)")
 message(STATUS "")
+
+# Native Win32 tray app that reuses the same runtime/core logic.
+add_executable(PixelsTray WIN32
+    tray_main.cpp
+    App/CliOptions.cpp
+    App/ConfigManager.cpp
+    App/DieConnection.cpp
+    App/DiceManager.cpp
+    App/Runtime/PixelsRuntimeService.cpp
+    App/Tray/TrayApp.cpp
+    App/CliOptions.h
+    App/ConfigManager.h
+    App/DieConnection.h
+    App/DiceManager.h
+    App/Runtime/RuntimeModels.h
+    App/Runtime/PixelsRuntimeService.h
+    App/Tray/TrayApp.h
+)
+
+target_link_libraries(PixelsTray PRIVATE PixelsLib shell32)
+
+target_compile_definitions(PixelsTray PRIVATE
+    WIN32_LEAN_AND_MEAN
+    WINRT_LEAN_AND_MEAN
+    NOMINMAX
+    UNICODE
+    _UNICODE
+)
+
+if(MSVC)
+    target_compile_options(PixelsTray PRIVATE
+        /permissive-
+        /bigobj
+        /await
+        /W4
+    )
+endif()
+
+set_target_properties(PixelsTray PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+install(TARGETS PixelsTray
+    RUNTIME DESTINATION bin
+)
