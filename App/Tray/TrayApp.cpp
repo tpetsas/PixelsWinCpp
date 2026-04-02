@@ -17,6 +17,116 @@ namespace
     constexpr int kSetupListId = 3001;
     constexpr int kSetupScanButtonId = 3002;
     constexpr int kSetupSaveButtonId = 3003;
+    constexpr int kCustomDlgIconId = 3010;
+    constexpr int kCustomDlgTextId = 3011;
+    constexpr int kCustomDlgOkId = 3012;
+
+    HINSTANCE g_hInstance = nullptr;
+    std::wstring g_dlgMessage;
+
+    INT_PTR CALLBACK CustomDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM)
+    {
+        switch (msg)
+        {
+        case WM_INITDIALOG:
+        {
+            // Center the dialog
+            RECT rc;
+            GetWindowRect(hwnd, &rc);
+            int w = rc.right - rc.left;
+            int h = rc.bottom - rc.top;
+            int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+            int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+            SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+            // Set window icon
+            HICON hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_D20_APP_ICON));
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIcon));
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hIcon));
+
+            // Get client rect to calculate positions
+            RECT clientRect;
+            GetClientRect(hwnd, &clientRect);
+            int cw = clientRect.right;
+            int ch = clientRect.bottom;
+
+            // Layout: icon centered at top, text below centered, button at bottom
+            int iconSize = 32;
+            int iconX = (cw - iconSize) / 2;
+            int iconY = 15;
+            int textX = 20;
+            int textY = iconY + iconSize + 20;
+            int textW = cw - 40;
+            int textH = ch - textY - 50;
+            int btnWidth = 80;
+            int btnHeight = 26;
+            int btnX = (cw - btnWidth) / 2;
+            int btnY = ch - btnHeight - 12;
+
+            // Create icon control - centered at top
+            HWND hIconCtrl = CreateWindowExW(0, L"STATIC", nullptr,
+                WS_CHILD | WS_VISIBLE | SS_ICON,
+                iconX, iconY, iconSize, iconSize, hwnd, reinterpret_cast<HMENU>(kCustomDlgIconId), g_hInstance, nullptr);
+            SendMessageW(hIconCtrl, STM_SETICON, reinterpret_cast<WPARAM>(hIcon), 0);
+
+            // Create text control - centered below icon
+            CreateWindowExW(0, L"STATIC", g_dlgMessage.c_str(),
+                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                textX, textY, textW, textH, hwnd, reinterpret_cast<HMENU>(kCustomDlgTextId), g_hInstance, nullptr);
+
+            // Create OK button - centered at bottom
+            HWND hBtn = CreateWindowExW(0, L"BUTTON", L"OK",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                btnX, btnY, btnWidth, btnHeight, hwnd, reinterpret_cast<HMENU>(kCustomDlgOkId), g_hInstance, nullptr);
+            SetFocus(hBtn);
+
+            return FALSE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == kCustomDlgOkId || LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
+            {
+                EndDialog(hwnd, IDOK);
+                return TRUE;
+            }
+            break;
+        case WM_CLOSE:
+            EndDialog(hwnd, IDOK);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    void ShowCustomMessageBox(HINSTANCE hInst, HWND hParent, const std::wstring& title, const std::wstring& message)
+    {
+        g_hInstance = hInst;
+        g_dlgMessage = message;
+
+        // Create dialog template in memory
+        #pragma pack(push, 4)
+        struct {
+            DWORD style;
+            DWORD dwExtendedStyle;
+            WORD cdit;
+            short x, y, cx, cy;
+            WORD menu, windowClass, title;
+            wchar_t titleText[64];
+        } dlgTemplate = {};
+        #pragma pack(pop)
+
+        dlgTemplate.style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        dlgTemplate.dwExtendedStyle = 0;
+        dlgTemplate.cdit = 0;
+        dlgTemplate.x = 0;
+        dlgTemplate.y = 0;
+        dlgTemplate.cx = 190;
+        dlgTemplate.cy = 85;
+        dlgTemplate.menu = 0;
+        dlgTemplate.windowClass = 0;
+        dlgTemplate.title = 0;
+        wcsncpy_s(dlgTemplate.titleText, title.c_str(), 63);
+
+        DialogBoxIndirectW(hInst, reinterpret_cast<LPCDLGTEMPLATEW>(&dlgTemplate), hParent, CustomDlgProc);
+    }
 
     std::string narrowAscii(const std::wstring& ws)
     {
@@ -84,11 +194,18 @@ TrayApp::~TrayApp()
         setupWindowHandle_ = nullptr;
     }
 
+    if (logWindowHandle_)
+    {
+        DestroyWindow(logWindowHandle_);
+        logWindowHandle_ = nullptr;
+    }
+
     statusWindowHandle_ = nullptr;
     statusTextHandle_ = nullptr;
     setupListHandle_ = nullptr;
     setupScanButtonHandle_ = nullptr;
     setupSaveButtonHandle_ = nullptr;
+    logTextHandle_ = nullptr;
 }
 
 bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPath)
@@ -96,6 +213,16 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
     instanceHandle_ = instanceHandle;
     configPath_ = configPath;
     taskbarCreatedMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
+
+    // Set up settings path (pixels.ini next to pixels.cfg)
+    const size_t slash = configPath_.find_last_of(L"\\/");
+    const std::wstring folder = (slash == std::wstring::npos) ? L"." : configPath_.substr(0, slash);
+    settingsPath_ = folder + L"\\pixels.ini";
+    logFilePath_ = folder + L"\\pixels_log.txt";
+
+    // Create default INI if missing and load settings
+    TraySettings::createDefaultIfMissing(settingsPath_);
+    loadSettings();
 
     if (!createMessageWindow())
     {
@@ -112,12 +239,22 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
         return false;
     }
 
+    if (!createLogWindow())
+    {
+        return false;
+    }
+
     if (!addTrayIcon())
     {
         return false;
     }
 
-    runtime_ = std::make_unique<PixelsRuntimeService>(nullptr, [this]()
+    auto logger = [this](const std::string& message)
+    {
+        appendLog(message);
+    };
+
+    runtime_ = std::make_unique<PixelsRuntimeService>(logger, [this]()
     {
         stateDirty_ = true;
     });
@@ -126,13 +263,8 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
     configLoaded_ = runtime_->loadConfig(narrowAscii(configPath_), error);
     if (!configLoaded_)
     {
-        std::wstring msg =
-            L"No valid pixels.cfg was found.\n\n"
-            L"Let's set up your dice now.\n"
-            L"We will start scanning immediately.\n\n"
-            L"Tip: by default, the first two discovered dice are pre-selected; just click 'Save Setup'.\n\n"
-            L"Config path:\n" + configPath_;
-        MessageBoxW(windowHandle_, msg.c_str(), L"Pixels Tray - First Time Setup", MB_ICONINFORMATION | MB_OK);
+        ShowCustomMessageBox(instanceHandle_, windowHandle_, L"Pixels Tray",
+            L"Welcome to Pixels Tray!\n\nNo dice configuration found.\nLet's set up your dice now.");
         showSetupWindow();
     }
     else if (!runtime_->start())
@@ -141,6 +273,7 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
     }
 
     SetTimer(windowHandle_, kTooltipTimerId, 1200, nullptr);
+    SetTimer(windowHandle_, kNotificationTimerId, 3000, nullptr);
     refreshTooltip();
     return true;
 }
@@ -191,7 +324,12 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         {
             refreshTooltip();
             updateStatusWindow();
+            updateLogWindow();
             stateDirty_ = false;
+        }
+        if (wParam == kNotificationTimerId)
+        {
+            checkAndShowNotifications();
         }
         return 0;
     case WM_COMMAND:
@@ -227,6 +365,7 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, kTooltipTimerId);
+        KillTimer(hwnd, kNotificationTimerId);
         if (runtime_)
         {
             runtime_->stop();
@@ -245,6 +384,46 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         {
             stopSetupScan();
             ShowWindow(setupWindowHandle_, SW_HIDE);
+            return 0;
+        }
+        if (hwnd == logWindowHandle_)
+        {
+            ShowWindow(logWindowHandle_, SW_HIDE);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+        if (hwnd == logWindowHandle_)
+        {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdc, RGB(0, 255, 0));
+            SetBkColor(hdc, RGB(12, 12, 12));
+            static HBRUSH hLogBrush = CreateSolidBrush(RGB(12, 12, 12));
+            return reinterpret_cast<LRESULT>(hLogBrush);
+        }
+        if (hwnd == statusWindowHandle_)
+        {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(hdc, RGB(0, 200, 255));
+            SetBkColor(hdc, RGB(18, 18, 24));
+            static HBRUSH hStatusBrush = CreateSolidBrush(RGB(18, 18, 24));
+            return reinterpret_cast<LRESULT>(hStatusBrush);
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    case WM_SIZE:
+        if (hwnd == logWindowHandle_ && logTextHandle_)
+        {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            SetWindowPos(logTextHandle_, nullptr, 0, 0, rc.right, rc.bottom, SWP_NOZORDER);
+            return 0;
+        }
+        if (hwnd == statusWindowHandle_ && statusTextHandle_)
+        {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            SetWindowPos(statusTextHandle_, nullptr, 0, 0, rc.right, rc.bottom, SWP_NOZORDER);
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -290,6 +469,9 @@ bool TrayApp::createStatusWindow()
     wc.lpfnWndProc = &TrayApp::windowProc;
     wc.hInstance = instanceHandle_;
     wc.lpszClassName = statusWindowClassName_.c_str();
+    wc.hbrBackground = CreateSolidBrush(RGB(18, 18, 24));
+    wc.hIcon = LoadIconW(instanceHandle_, MAKEINTRESOURCEW(IDI_D20_APP_ICON));
+    wc.hIconSm = LoadIconW(instanceHandle_, MAKEINTRESOURCEW(IDI_D20_APP_ICON));
 
     if (!RegisterClassExW(&wc))
     {
@@ -297,14 +479,14 @@ bool TrayApp::createStatusWindow()
     }
 
     statusWindowHandle_ = CreateWindowExW(
-        WS_EX_TOOLWINDOW,
+        0,
         statusWindowClassName_.c_str(),
-        L"Pixels Status",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        L"Pixels Dice Status",
+        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        460,
-        320,
+        500,
+        480,
         nullptr,
         nullptr,
         instanceHandle_,
@@ -316,18 +498,27 @@ bool TrayApp::createStatusWindow()
     }
 
     statusTextHandle_ = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        0,
         L"EDIT",
         L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-        10,
-        10,
-        420,
-        260,
+        0,
+        0,
+        500,
+        480,
         statusWindowHandle_,
         nullptr,
         instanceHandle_,
         nullptr);
+
+    HFONT statusFont = CreateFontW(
+        15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    if (statusFont)
+    {
+        SendMessageW(statusTextHandle_, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont), TRUE);
+    }
 
     return statusTextHandle_ != nullptr;
 }
@@ -339,6 +530,8 @@ bool TrayApp::createSetupWindow()
     wc.lpfnWndProc = &TrayApp::windowProc;
     wc.hInstance = instanceHandle_;
     wc.lpszClassName = setupWindowClassName_.c_str();
+    wc.hIcon = LoadIconW(instanceHandle_, MAKEINTRESOURCEW(IDI_D20_APP_ICON));
+    wc.hIconSm = LoadIconW(instanceHandle_, MAKEINTRESOURCEW(IDI_D20_APP_ICON));
 
     if (!RegisterClassExW(&wc))
     {
@@ -346,14 +539,14 @@ bool TrayApp::createSetupWindow()
     }
 
     setupWindowHandle_ = CreateWindowExW(
-        WS_EX_TOOLWINDOW,
+        0,
         setupWindowClassName_.c_str(),
         L"Pixels Setup",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         560,
-        420,
+        480,
         nullptr,
         nullptr,
         instanceHandle_,
@@ -367,11 +560,11 @@ bool TrayApp::createSetupWindow()
     CreateWindowExW(
         0,
         L"STATIC",
-        L"Scan and select 1 or 2 dice, then click Save Setup:",
+        L"Wait until all your dice appear in the list, select them, then click Save Setup:",
         WS_CHILD | WS_VISIBLE,
         12,
         12,
-        520,
+        530,
         20,
         setupWindowHandle_,
         nullptr,
@@ -615,7 +808,8 @@ void TrayApp::saveSetupSelection()
 
     stateDirty_ = true;
     updateStatusWindow();
-    MessageBoxW(windowHandle_, L"Setup saved successfully and runtime restarted.", L"Pixels Tray", MB_OK | MB_ICONINFORMATION);
+    ShowCustomMessageBox(instanceHandle_, windowHandle_, L"Pixels Tray",
+        L"Setup saved!\n\nYour dice are now being connected.");
 }
 
 void TrayApp::updateStatusWindow()
@@ -732,45 +926,89 @@ std::wstring TrayApp::buildTooltipText() const
 std::wstring TrayApp::buildStatusWindowText() const
 {
     std::wstringstream ss;
-    ss << L"Pixels Tray Status\r\n\r\n";
+    ss << L"PIXELS DICE STATUS\r\n";
+    ss << L"==================\r\n\r\n";
 
     if (!runtime_)
     {
-        ss << L"Runtime unavailable.";
+        ss << L"[X] Runtime unavailable.";
         return ss.str();
     }
 
-    ss << L"Running: " << (runtime_->isRunning() ? L"yes" : L"no") << L"\r\n";
-    ss << L"Scanning: " << (runtime_->isScanning() ? L"yes" : L"no") << L"\r\n";
-    ss << L"Config: " << (configLoaded_ ? L"loaded" : L"missing/invalid") << L"\r\n\r\n";
+    ss << L"SYSTEM\r\n";
+    ss << L"------\r\n";
+    ss << L"  Running:   " << (runtime_->isRunning() ? L"Yes" : L"No") << L"\r\n";
+    ss << L"  Scanning:  " << (runtime_->isScanning() ? L"Yes" : L"No") << L"\r\n";
+    ss << L"  Config:    " << (configLoaded_ ? L"Loaded" : L"Missing") << L"\r\n\r\n";
 
     const auto snapshots = runtime_->snapshotDice();
     if (snapshots.empty())
     {
-        ss << L"No configured dice found in runtime.";
+        ss << L"No configured dice found.";
         return ss.str();
     }
 
     for (size_t i = 0; i < snapshots.size(); ++i)
     {
         const auto& die = snapshots[i];
-        ss << L"Die " << (i + 1) << L" (" << toWide(die.label) << L")\r\n";
-        ss << L"  Status: " << statusToWide(die.status) << L"\r\n";
-        ss << L"  Battery: " << die.batteryLevel << L"%" << (die.isCharging ? L" (charging)" : L"") << L"\r\n";
-        ss << L"  Current face: " << die.currentFace << L"\r\n";
-        if (die.hasLastRoll)
+        const DiceTheme theme = getDiceTheme(die.label);
+
+        ss << theme.displayName << L" (Die " << (i + 1) << L")\r\n";
+        ss << L"------\r\n";
+
+        std::wstring statusIcon;
+        switch (die.status)
         {
-            ss << L"  Last roll: " << die.lastRollFace << L"\r\n";
+        case Systemic::Pixels::PixelStatus::Ready:
+            statusIcon = L"[OK]";
+            break;
+        case Systemic::Pixels::PixelStatus::Connecting:
+        case Systemic::Pixels::PixelStatus::Identifying:
+            statusIcon = L"[..]";
+            break;
+        case Systemic::Pixels::PixelStatus::Disconnected:
+            statusIcon = L"[--]";
+            break;
+        default:
+            statusIcon = L"[??]";
+            break;
+        }
+        ss << L"  Status:     " << statusIcon << L" " << statusToWide(die.status) << L"\r\n";
+
+        std::wstring batteryIcon;
+        if (die.isCharging)
+        {
+            batteryIcon = L"[+]";
+        }
+        else if (die.batteryLevel > 50)
+        {
+            batteryIcon = L"[=]";
+        }
+        else if (die.batteryLevel > 20)
+        {
+            batteryIcon = L"[-]";
         }
         else
         {
-            ss << L"  Last roll: n/a\r\n";
+            batteryIcon = L"[!]";
+        }
+        ss << L"  Battery:    " << batteryIcon << L" " << die.batteryLevel << L"%" << (die.isCharging ? L" (charging)" : L"") << L"\r\n";
+
+        ss << L"  Current:    " << die.currentFace << L"\r\n";
+
+        if (die.hasLastRoll)
+        {
+            ss << L"  Last Roll:  " << die.lastRollFace << L"\r\n";
+        }
+        else
+        {
+            ss << L"  Last Roll:  --\r\n";
         }
 
-        ss << L"  Recent rolls: ";
+        ss << L"  Recent:     ";
         if (die.recentRollFaces.empty())
         {
-            ss << L"n/a";
+            ss << L"--";
         }
         else
         {
@@ -778,7 +1016,7 @@ std::wstring TrayApp::buildStatusWindowText() const
             {
                 if (r > 0)
                 {
-                    ss << L", ";
+                    ss << L" > ";
                 }
                 ss << die.recentRollFaces[r];
             }
@@ -816,32 +1054,21 @@ void TrayApp::showContextMenu()
         {
             const auto& die = snapshots[i];
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, formatDieMenuLine(die, static_cast<int>(i + 1)).c_str());
-            if (!die.recentRollFaces.empty())
-            {
-                std::wstringstream rs;
-                rs << L"  Recent: ";
-                for (size_t r = 0; r < die.recentRollFaces.size(); ++r)
-                {
-                    if (r > 0)
-                    {
-                        rs << L", ";
-                    }
-                    rs << die.recentRollFaces[r];
-                }
-                AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, rs.str().c_str());
-            }
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
 
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_RESCAN, L"Rescan dice");
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_SETUP, L"Setup dice");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_SHOW_STATUS, L"\U0001F3B2  Show Status");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_SHOW_LOGS, L"\U0001F4DC  Show Roll Log");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXPORT_CFG, L"Export pixels.cfg");
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_IMPORT_CFG, L"Import pixels.cfg");
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_FOLDER, L"Open config folder");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_RESCAN, L"\U0001F504  Rescan Dice");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_SETUP, L"\u2699  Setup Dice...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_QUIT, L"Quit");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXPORT_CFG, L"\U0001F4E4  Export Config...");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_IMPORT_CFG, L"\U0001F4E5  Import Config...");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN_FOLDER, L"\U0001F4C1  Open Config Folder");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_QUIT, L"\u274C  Quit");
 
     POINT pt{};
     GetCursorPos(&pt);
@@ -854,6 +1081,12 @@ void TrayApp::handleCommand(UINT commandId)
 {
     switch (commandId)
     {
+    case IDM_TRAY_SHOW_STATUS:
+        showStatusWindow();
+        break;
+    case IDM_TRAY_SHOW_LOGS:
+        showLogWindow();
+        break;
     case IDM_TRAY_RESCAN:
         doRescan();
         break;
@@ -1019,4 +1252,291 @@ std::wstring TrayApp::configFolder() const
         return L".";
     }
     return configPath_.substr(0, slash);
+}
+
+bool TrayApp::createLogWindow()
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = &TrayApp::windowProc;
+    wc.hInstance = instanceHandle_;
+    wc.lpszClassName = logWindowClassName_.c_str();
+    wc.hbrBackground = CreateSolidBrush(RGB(12, 12, 12));
+    wc.hIcon = LoadIconW(instanceHandle_, MAKEINTRESOURCEW(IDI_D20_APP_ICON));
+    wc.hIconSm = LoadIconW(instanceHandle_, MAKEINTRESOURCEW(IDI_D20_APP_ICON));
+
+    if (!RegisterClassExW(&wc))
+    {
+        return false;
+    }
+
+    logWindowHandle_ = CreateWindowExW(
+        0,
+        logWindowClassName_.c_str(),
+        L"Pixels Roll Log",
+        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        700,
+        500,
+        nullptr,
+        nullptr,
+        instanceHandle_,
+        this);
+
+    if (!logWindowHandle_)
+    {
+        return false;
+    }
+
+    logTextHandle_ = CreateWindowExW(
+        0,
+        L"EDIT",
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
+        0,
+        0,
+        700,
+        500,
+        logWindowHandle_,
+        nullptr,
+        instanceHandle_,
+        nullptr);
+
+    HFONT monoFont = CreateFontW(
+        15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    if (monoFont)
+    {
+        SendMessageW(logTextHandle_, WM_SETFONT, reinterpret_cast<WPARAM>(monoFont), TRUE);
+    }
+
+    return logTextHandle_ != nullptr;
+}
+
+void TrayApp::showLogWindow()
+{
+    if (!logWindowHandle_)
+    {
+        return;
+    }
+
+    updateLogWindow();
+    ShowWindow(logWindowHandle_, SW_SHOWNORMAL);
+    SetForegroundWindow(logWindowHandle_);
+}
+
+void TrayApp::appendLog(const std::string& message)
+{
+    std::wstring wideMsg = toWide(message);
+
+    // Always write to file if enabled (full logging)
+    if (settings_.logToFile)
+    {
+        writeLogToFile(wideMsg);
+    }
+
+    // Only show in UI if it passes the filter
+    if (!shouldShowLogMessage(message))
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        logLines_.push_back(wideMsg);
+        while (logLines_.size() > kMaxLogLines)
+        {
+            logLines_.pop_front();
+        }
+    }
+
+    stateDirty_ = true;
+}
+
+void TrayApp::updateLogWindow()
+{
+    if (!logWindowHandle_ || !logTextHandle_)
+    {
+        return;
+    }
+
+    if (!IsWindowVisible(logWindowHandle_))
+    {
+        return;
+    }
+
+    std::wstringstream ss;
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        for (const auto& line : logLines_)
+        {
+            ss << line << L"\r\n";
+        }
+    }
+
+    SetWindowTextW(logTextHandle_, ss.str().c_str());
+
+    SendMessageW(logTextHandle_, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+    SendMessageW(logTextHandle_, EM_SCROLLCARET, 0, 0);
+}
+
+void TrayApp::checkAndShowNotifications()
+{
+    if (!runtime_ || !configLoaded_)
+    {
+        return;
+    }
+
+    const auto snapshots = runtime_->snapshotDice();
+    if (snapshots.empty())
+    {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    bool allReady = true;
+    for (const auto& die : snapshots)
+    {
+        if (die.status != Systemic::Pixels::PixelStatus::Ready)
+        {
+            allReady = false;
+        }
+    }
+
+    if (allReady && !allDiceReadyNotified_)
+    {
+        allDiceReadyNotified_ = true;
+        std::wstringstream msg;
+        msg << L"All " << snapshots.size() << L" Pixels dice are connected and ready to roll!";
+        showBalloonNotification(L"Pixels Ready!", msg.str());
+    }
+
+    for (const auto& die : snapshots)
+    {
+        if (die.batteryLevel <= kLowBatteryThreshold && !die.isCharging && die.hasPixel)
+        {
+            if (lowBatteryNotifiedIds_.find(die.targetPixelId) == lowBatteryNotifiedIds_.end())
+            {
+                lowBatteryNotifiedIds_.insert(die.targetPixelId);
+                std::wstringstream msg;
+                msg << toWide(die.label) << L" battery is at " << die.batteryLevel << L"%.\nPlease charge it soon!";
+                showBalloonNotification(L"Low Battery Warning", msg.str(), NIIF_WARNING);
+            }
+        }
+
+        if (die.status == Systemic::Pixels::PixelStatus::Disconnected)
+        {
+            auto it = disconnectTimestamps_.find(die.targetPixelId);
+            if (it == disconnectTimestamps_.end())
+            {
+                disconnectTimestamps_[die.targetPixelId] = now;
+            }
+            else
+            {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+                if (elapsed >= kDisconnectWarningSeconds)
+                {
+                    if (disconnectWarningShownIds_.find(die.targetPixelId) == disconnectWarningShownIds_.end())
+                    {
+                        disconnectWarningShownIds_.insert(die.targetPixelId);
+                        std::wstringstream msg;
+                        msg << toWide(die.label) << L" has been disconnected for over " << kDisconnectWarningSeconds << L" seconds.\nCheck if the die is nearby or needs charging.";
+                        showBalloonNotification(L"Dice Disconnected", msg.str(), NIIF_WARNING);
+                    }
+                }
+            }
+        }
+        else
+        {
+            disconnectTimestamps_.erase(die.targetPixelId);
+            disconnectWarningShownIds_.erase(die.targetPixelId);
+        }
+    }
+}
+
+void TrayApp::showBalloonNotification(const std::wstring& title, const std::wstring& message, DWORD iconType)
+{
+    if (!trayIconAdded_)
+    {
+        return;
+    }
+
+    trayIconData_.uFlags = NIF_INFO;
+    wcsncpy_s(trayIconData_.szInfoTitle, _countof(trayIconData_.szInfoTitle), title.c_str(), _TRUNCATE);
+    wcsncpy_s(trayIconData_.szInfo, _countof(trayIconData_.szInfo), message.c_str(), _TRUNCATE);
+    trayIconData_.dwInfoFlags = iconType;
+    trayIconData_.uTimeout = 5000;
+
+    Shell_NotifyIconW(NIM_MODIFY, &trayIconData_);
+}
+
+TrayApp::DiceTheme TrayApp::getDiceTheme(const std::string& label) const
+{
+    DiceTheme theme;
+
+    std::string lowerLabel = label;
+    for (char& c : lowerLabel)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    if (lowerLabel.find("aurora") != std::string::npos || lowerLabel.find("sky") != std::string::npos)
+    {
+        theme.primaryColor = RGB(0, 191, 255);
+        theme.secondaryColor = RGB(135, 206, 250);
+        theme.textColor = RGB(0, 51, 102);
+        theme.displayName = L"Aurora Sky";
+    }
+    else if (lowerLabel.find("midnight") != std::string::npos || lowerLabel.find("galaxy") != std::string::npos)
+    {
+        theme.primaryColor = RGB(75, 0, 130);
+        theme.secondaryColor = RGB(138, 43, 226);
+        theme.textColor = RGB(230, 230, 250);
+        theme.displayName = L"Midnight Galaxy";
+    }
+    else
+    {
+        theme.primaryColor = RGB(100, 100, 100);
+        theme.secondaryColor = RGB(150, 150, 150);
+        theme.textColor = RGB(255, 255, 255);
+        theme.displayName = L"Pixels Die";
+    }
+
+    return theme;
+}
+
+void TrayApp::loadSettings()
+{
+    settings_ = TraySettings::load(settingsPath_);
+
+    if (settings_.logToFile)
+    {
+        std::wstring path = settings_.logFilePath.empty() ? logFilePath_ : settings_.logFilePath;
+        logFile_.open(std::string(path.begin(), path.end()), std::ios::app);
+    }
+}
+
+void TrayApp::writeLogToFile(const std::wstring& message)
+{
+    if (!logFile_.is_open())
+    {
+        return;
+    }
+
+    std::string narrow(message.begin(), message.end());
+    logFile_ << narrow << std::endl;
+}
+
+bool TrayApp::shouldShowLogMessage(const std::string& message) const
+{
+    if (settings_.debugMode)
+    {
+        return true;
+    }
+
+    // In non-debug mode, only show roll results
+    return message.find("Rolled on face") != std::string::npos;
 }
