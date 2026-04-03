@@ -319,11 +319,12 @@ std::future<Pixel::ConnectResult> DieConnection::connectAndInitialize(const std:
 {
     log("Connecting...");
 
-    auto result = co_await pixel->connectAsync();
+    // Use maintainConnection=true for automatic reconnection after unexpected disconnection
+    auto result = co_await pixel->connectAsync(true);
     if (result != Pixel::ConnectResult::Success)
     {
         log("First connection attempt failed, retrying...");
-        result = co_await pixel->connectAsync();
+        result = co_await pixel->connectAsync(true);
     }
 
     if (result == Pixel::ConnectResult::Success)
