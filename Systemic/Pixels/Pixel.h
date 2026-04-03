@@ -236,49 +236,50 @@ namespace Systemic::Pixels
             return _data.rollState;
         }
 
-        virtual int currentFace() const override
-        {
-            return _data.currentFace;
-        }
+    virtual int currentFace() const override
+    {
+        return _data.currentFace;
+    }
 
-        /**
-         * @brief Asynchronously tries to connect to the die.
-         * @note The request times out after 7 to 20s if device is not reachable.
-         * @return A future with the result of the operation.
-         */
-        std::future<ConnectResult> connectAsync();
+    /**
+     * @brief Asynchronously tries to connect to the die.
+     * @param maintainConnection Whether to automatically reconnect after an unexpected disconnection.
+     * @note The request times out after 7 to 20s if device is not reachable.
+     * @return A future with the result of the operation.
+     */
+    std::future<ConnectResult> connectAsync(bool maintainConnection = false);
 
-        /**
-         * @brief Immediately disconnects from the die.
-         */
-        void disconnect();
+    /**
+     * @brief Immediately disconnects from the die.
+     */
+    void disconnect();
 
-        /**
-         * @brief Sends a message to the Pixel.
-         * @param type Type of message to send.
-         * @param withoutAck Whether to request a confirmation that the message was received.
-         * @return A future with a boolean indicating whether the operation succeeded.
-         */
-        std::future<bool> sendMessageAsync(Messages::MessageType type, bool withoutAck = false)
-        {
-            std::vector<uint8_t> data{ static_cast<uint8_t>(type) };
-            return sendMessageAsync(data, withoutAck);
-        }
+    /**
+     * @brief Sends a message to the Pixel.
+     * @param type Type of message to send.
+     * @param withoutAck Whether to request a confirmation that the message was received.
+     * @return A future with a boolean indicating whether the operation succeeded.
+     */
+    std::future<bool> sendMessageAsync(Messages::MessageType type, bool withoutAck = false)
+    {
+        std::vector<uint8_t> data{ static_cast<uint8_t>(type) };
+        return sendMessageAsync(data, withoutAck);
+    }
 
-        /**
-         * @brief Sends a message to the Pixel.
-         * @tparam T Type of the message.
-         * @param message Message to send.
-         * @param withoutAck Whether to request a confirmation that the message was received.
-         * @return A future with a boolean indicating whether the operation succeeded.
-         */
-        template <typename T, std::enable_if_t<std::is_base_of_v<Messages::PixelMessage, T>, int> = 0>
-        std::future<bool> sendMessageAsync(const T& message, bool withoutAck = false)
-        {
-            std::vector<uint8_t> data{};
-            Messages::Serialization::serializeMessage(message, data);
-            return sendMessageAsync(data, withoutAck);
-        }
+    /**
+     * @brief Sends a message to the Pixel.
+     * @tparam T Type of the message.
+     * @param message Message to send.
+     * @param withoutAck Whether to request a confirmation that the message was received.
+     * @return A future with a boolean indicating whether the operation succeeded.
+     */
+    template <typename T, std::enable_if_t<std::is_base_of_v<Messages::PixelMessage, T>, int> = 0>
+    std::future<bool> sendMessageAsync(const T& message, bool withoutAck = false)
+    {
+        std::vector<uint8_t> data{};
+        Messages::Serialization::serializeMessage(message, data);
+        return sendMessageAsync(data, withoutAck);
+    }
 
         /**
          * @brief Sends a message to the Pixel and wait for a specific reply.

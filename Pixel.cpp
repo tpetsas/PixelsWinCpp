@@ -39,13 +39,13 @@ namespace Systemic::Pixels
     {
     }
 
-            std::future<Pixel::ConnectResult> Pixel::connectAsync()
+            std::future<Pixel::ConnectResult> Pixel::connectAsync(bool maintainConnection)
             {
                 auto result = ConnectResult::Success;
 
                 try
                 {
-                    const auto connectStatus = co_await _peripheral->connectAsync({ PixelBleUuids::service });
+                    const auto connectStatus = co_await _peripheral->connectAsync({ PixelBleUuids::service }, maintainConnection);
 
                     if (connectStatus == BleRequestStatus::Success)
                     {
