@@ -118,8 +118,8 @@ namespace
         dlgTemplate.cdit = 0;
         dlgTemplate.x = 0;
         dlgTemplate.y = 0;
-        dlgTemplate.cx = 190;
-        dlgTemplate.cy = 85;
+        dlgTemplate.cx = 220;
+        dlgTemplate.cy = 100;
         dlgTemplate.menu = 0;
         dlgTemplate.windowClass = 0;
         dlgTemplate.title = 0;
@@ -485,8 +485,8 @@ bool TrayApp::createStatusWindow()
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        500,
-        480,
+        900,
+        800,
         nullptr,
         nullptr,
         instanceHandle_,
@@ -504,15 +504,15 @@ bool TrayApp::createStatusWindow()
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
         0,
         0,
-        500,
-        480,
+        900,
+        800,
         statusWindowHandle_,
         nullptr,
         instanceHandle_,
         nullptr);
 
     HFONT statusFont = CreateFontW(
-        15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (statusFont)
@@ -1277,8 +1277,8 @@ bool TrayApp::createLogWindow()
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        700,
-        500,
+        900,
+        650,
         nullptr,
         nullptr,
         instanceHandle_,
@@ -1296,15 +1296,15 @@ bool TrayApp::createLogWindow()
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
         0,
         0,
-        700,
-        500,
+        900,
+        650,
         logWindowHandle_,
         nullptr,
         instanceHandle_,
         nullptr);
 
     HFONT monoFont = CreateFontW(
-        15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (monoFont)
@@ -1378,7 +1378,9 @@ void TrayApp::updateLogWindow()
 
     SetWindowTextW(logTextHandle_, ss.str().c_str());
 
-    SendMessageW(logTextHandle_, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+    // Auto-scroll to bottom to show newest messages
+    int textLen = GetWindowTextLengthW(logTextHandle_);
+    SendMessageW(logTextHandle_, EM_SETSEL, textLen, textLen);
     SendMessageW(logTextHandle_, EM_SCROLLCARET, 0, 0);
 }
 
