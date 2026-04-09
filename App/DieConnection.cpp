@@ -48,6 +48,21 @@ namespace
     }
 }
 
+const char* DieConnection::connectionStateToString(ConnectionState state)
+{
+    switch (state)
+    {
+    case ConnectionState::Unselected:   return "Unselected";
+    case ConnectionState::Selected:     return "Selected";
+    case ConnectionState::Connecting:   return "Connecting";
+    case ConnectionState::Ready:        return "Ready";
+    case ConnectionState::Stale:        return "Stale";
+    case ConnectionState::Reconnecting: return "Reconnecting";
+    case ConnectionState::Shutdown:     return "Shutdown";
+    default:                            return "Unknown";
+    }
+}
+
 class DieConnection::Delegate : public PixelDelegate
 {
 public:
@@ -144,20 +159,24 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        if (shuttingDown_ || connecting_)
+        if (shuttingDown_ || connectionState_ == ConnectionState::Connecting ||
+            connectionState_ == ConnectionState::Reconnecting)
         {
             return false;
         }
 
-        if (!selected_)
+        // Store ScannedPixel for potential reconstructive reconnect later
+        lastScannedPixel_ = scannedPixel;
+
+        if (connectionState_ == ConnectionState::Unselected)
         {
-            selected_ = true;
+            setConnectionState(ConnectionState::Selected);
             firstSelection = true;
         }
 
         if (!pixel_)
         {
-            connecting_ = true;
+            setConnectionState(ConnectionState::Connecting);
             lastConnectAttempt_ = std::chrono::steady_clock::now();
             pixel_ = Pixel::create(*scannedPixel, delegate_);
             lastAnyMessage_ = std::chrono::steady_clock::now();
@@ -194,50 +213,78 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
 void DieConnection::tickWatchdog()
 {
     std::shared_ptr<Pixel> localPixel;
-    bool connecting = false;
+    ConnectionState currentConnState = ConnectionState::Unselected;
     PixelStatus currentStatus = PixelStatus::Disconnected;
     bool shouldTryReconnect = false;
+    int backoffSeconds = kBaseBackoffSeconds;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        connecting = connecting_;
+        currentConnState = connectionState_;
         localPixel = pixel_;
         if (localPixel)
         {
             currentStatus = localPixel->status();
         }
 
+        // Don't do anything if we're already connecting/reconnecting or shutdown
+        if (currentConnState == ConnectionState::Connecting ||
+            currentConnState == ConnectionState::Reconnecting ||
+            currentConnState == ConnectionState::Shutdown ||
+            currentConnState == ConnectionState::Unselected)
+        {
+            return;
+        }
+
         const auto now = std::chrono::steady_clock::now();
         const auto connectAge = std::chrono::duration_cast<std::chrono::seconds>(now - lastConnectAttempt_).count();
 
-        // Only handle explicit disconnection here
-        // Stale connection detection is handled in tickPoll() by checking for identical data
-        if (localPixel && !connecting_ && currentStatus == PixelStatus::Disconnected)
+        // Calculate exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s (max)
+        backoffSeconds = std::min(kMaxBackoffSeconds, kBaseBackoffSeconds * (1 << consecutiveFailures_));
+
+        // Handle explicit disconnection
+        if (localPixel && currentStatus == PixelStatus::Disconnected)
         {
-            log("[watchdog] Disconnected, elapsed=" + std::to_string(connectAge) + "s since last attempt");
-            if (connectAge >= 5)
+            log("[watchdog] Disconnected, elapsed=" + std::to_string(connectAge) +
+                "s since last attempt (backoff=" + std::to_string(backoffSeconds) +
+                "s, failures=" + std::to_string(consecutiveFailures_) + ")");
+
+            if (connectAge >= backoffSeconds)
             {
                 shouldTryReconnect = true;
             }
         }
     }
 
-    if (!localPixel || connecting || !shouldTryReconnect)
+    if (!localPixel || !shouldTryReconnect)
     {
         return;
     }
 
-    log("[watchdog] Trying to connect/reconnect...");
-    reconnectPixel();
+    // After multiple failures, try reconstructive reconnect (destroy and recreate Pixel)
+    if (consecutiveFailures_ >= 2)
+    {
+        log("[watchdog] Multiple failures, trying reconstructive reconnect...");
+        reconstructiveReconnect();
+    }
+    else
+    {
+        log("[watchdog] Trying to reconnect...");
+        reconnectPixel();
+    }
 }
 
 void DieConnection::tickPoll()
 {
     std::shared_ptr<Pixel> localPixel;
+    ConnectionState currentConnState = ConnectionState::Unselected;
     bool shouldReconnect = false;
+    long long secondsSinceLastMessage = 0;
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         localPixel = pixel_;
+        currentConnState = connectionState_;
     }
 
     if (!localPixel)
@@ -250,45 +297,46 @@ void DieConnection::tickPoll()
     const int currentBattery = localPixel->batteryLevel();
     const auto currentStatus = localPixel->status();
 
-    log("[poll] status=" + toStatusString(currentStatus) +
-        ", face=" + std::to_string(currentFace) +
-        ", rollState=" + std::to_string(static_cast<int>(localPixel->rollState())) +
-        ", battery=" + std::to_string(currentBattery) +
-        ", rssi=" + std::to_string(currentRssi));
-
-    // Detect stale connection: if poll data is identical for multiple cycles,
-    // the connection is likely stale (we're reading cached data, not live data)
+    // Stale connection detection based on message timing
+    // This is more reliable than comparing poll values
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (connectedOnce_ && currentStatus == PixelStatus::Ready)
+        if (currentConnState == ConnectionState::Ready && currentStatus == PixelStatus::Ready)
         {
-            if (currentRssi == lastPollRssi_ && currentFace == lastPollFace_ && currentBattery == lastPollBattery_)
+            const auto now = std::chrono::steady_clock::now();
+            secondsSinceLastMessage = std::chrono::duration_cast<std::chrono::seconds>(now - lastAnyMessage_).count();
+            const auto secondsSinceConnect = std::chrono::duration_cast<std::chrono::seconds>(now - lastSuccessfulConnect_).count();
+
+            // Don't check for stale during grace period after reconnect
+            // This prevents false positives when BLE stack is still stabilizing
+            if (secondsSinceConnect < kStaleGracePeriodSeconds)
             {
-                identicalPollCount_++;
-                // If we've seen identical data for 3+ polls (about 90 seconds with 30s poll interval),
-                // the connection is likely stale
-                if (identicalPollCount_ >= 3)
-                {
-                    log("[poll] Stale connection detected (identical data for " + std::to_string(identicalPollCount_) + " polls)");
-                    shouldReconnect = true;
-                    identicalPollCount_ = 0;
-                }
+                // Still in grace period, don't check stale
             }
-            else
+            else if (secondsSinceLastMessage >= kStaleTimeoutSeconds)
             {
-                // Data changed, connection is alive
-                identicalPollCount_ = 0;
+                // If no messages for 20+ seconds, connection is likely stale
+                // (RSSI updates should come every ~5 seconds when connection is healthy)
+                log("[poll] Stale connection detected (no messages for " + std::to_string(secondsSinceLastMessage) + "s)");
+                setConnectionState(ConnectionState::Stale);
+                shouldReconnect = true;
             }
-            lastPollRssi_ = currentRssi;
-            lastPollFace_ = currentFace;
-            lastPollBattery_ = currentBattery;
         }
     }
 
+    log("[poll] state=" + std::string(connectionStateToString(currentConnState)) +
+        ", status=" + toStatusString(currentStatus) +
+        ", face=" + std::to_string(currentFace) +
+        ", rollState=" + std::to_string(static_cast<int>(localPixel->rollState())) +
+        ", battery=" + std::to_string(currentBattery) +
+        ", rssi=" + std::to_string(currentRssi) +
+        ", lastMsg=" + std::to_string(secondsSinceLastMessage) + "s ago");
+
     if (shouldReconnect)
     {
-        log("[poll] Forcing reconnection due to stale data...");
-        reconnectPixel();
+        log("[poll] Forcing reconnection due to stale connection...");
+        // Use reconstructive reconnect for stale connections
+        reconstructiveReconnect();
     }
 }
 
@@ -299,6 +347,7 @@ void DieConnection::shutdown()
     {
         std::lock_guard<std::mutex> lock(mutex_);
         shuttingDown_ = true;
+        setConnectionState(ConnectionState::Shutdown);
         localPixel = pixel_;
     }
 
@@ -322,7 +371,13 @@ void DieConnection::shutdown()
 bool DieConnection::isSelected() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return selected_;
+    return connectionState_ != ConnectionState::Unselected;
+}
+
+ConnectionState DieConnection::connectionState() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connectionState_;
 }
 
 DieStatusSnapshot DieConnection::snapshot() const
@@ -332,9 +387,12 @@ DieStatusSnapshot DieConnection::snapshot() const
     snapshot.label = label_;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    snapshot.selected = selected_;
-    snapshot.connecting = connecting_;
-    snapshot.connectedOnce = connectedOnce_;
+    snapshot.selected = (connectionState_ != ConnectionState::Unselected);
+    snapshot.connecting = (connectionState_ == ConnectionState::Connecting ||
+                           connectionState_ == ConnectionState::Reconnecting);
+    snapshot.connectedOnce = (connectionState_ == ConnectionState::Ready ||
+                              connectionState_ == ConnectionState::Stale ||
+                              connectionState_ == ConnectionState::Reconnecting);
     snapshot.hasPixel = (pixel_ != nullptr);
     snapshot.hasLastRoll = hasLastRoll_;
     snapshot.lastRollFace = lastRollFace_;
@@ -405,17 +463,18 @@ bool DieConnection::reconnectPixel()
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (shuttingDown_ || connecting_ || !pixel_)
+        if (shuttingDown_ || !pixel_ ||
+            connectionState_ == ConnectionState::Connecting ||
+            connectionState_ == ConnectionState::Reconnecting)
         {
             return false;
         }
-        connecting_ = true;
+        setConnectionState(ConnectionState::Reconnecting);
         lastConnectAttempt_ = std::chrono::steady_clock::now();
         localPixel = pixel_;
     }
 
-    // Preserve old behavior: explicit disconnect before retrying connect.
-    log("[watchdog] Reconnecting...");
+    log("[reconnect] Disconnecting and reconnecting same Pixel object...");
 
     try
     {
@@ -433,17 +492,107 @@ bool DieConnection::reconnectPixel()
     }
     catch (const std::exception& ex)
     {
-        log(std::string("[watchdog] Reconnect exception: ") + ex.what());
+        log(std::string("[reconnect] Exception: ") + ex.what());
     }
     catch (...)
     {
-        log("[watchdog] Reconnect unknown exception.");
+        log("[reconnect] Unknown exception.");
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        connecting_ = false;
-        connectedOnce_ = ok;
+        if (ok)
+        {
+            setConnectionState(ConnectionState::Ready);
+            consecutiveFailures_ = 0;
+            lastSuccessfulConnect_ = std::chrono::steady_clock::now();
+        }
+        else
+        {
+            setConnectionState(ConnectionState::Selected);
+            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 5); // Cap at 5 (64s max backoff)
+        }
+        lastAnyMessage_ = std::chrono::steady_clock::now();
+        lastRollEvent_ = lastAnyMessage_;
+    }
+
+    notifyStateChanged();
+
+    return ok;
+}
+
+bool DieConnection::reconstructiveReconnect()
+{
+    std::shared_ptr<Pixel> oldPixel;
+    std::shared_ptr<const ScannedPixel> scannedPixel;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shuttingDown_ || !lastScannedPixel_ ||
+            connectionState_ == ConnectionState::Connecting ||
+            connectionState_ == ConnectionState::Reconnecting)
+        {
+            return false;
+        }
+        setConnectionState(ConnectionState::Reconnecting);
+        lastConnectAttempt_ = std::chrono::steady_clock::now();
+        oldPixel = pixel_;
+        scannedPixel = lastScannedPixel_;
+    }
+
+    log("[reconstructive] Destroying old Pixel and creating new one from ScannedPixel...");
+
+    // Disconnect and destroy old Pixel
+    if (oldPixel)
+    {
+        try
+        {
+            oldPixel->disconnect();
+        }
+        catch (...)
+        {
+        }
+    }
+
+    // Create new Pixel from stored ScannedPixel data
+    auto newPixel = Pixel::create(*scannedPixel, delegate_);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pixel_ = newPixel;
+        lastAnyMessage_ = std::chrono::steady_clock::now();
+        lastRollEvent_ = lastAnyMessage_;
+    }
+
+    bool ok = false;
+    try
+    {
+        const auto result = connectAndInitialize(newPixel).get();
+        ok = (result == Pixel::ConnectResult::Success);
+    }
+    catch (const std::exception& ex)
+    {
+        log(std::string("[reconstructive] Exception: ") + ex.what());
+    }
+    catch (...)
+    {
+        log("[reconstructive] Unknown exception.");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ok)
+        {
+            setConnectionState(ConnectionState::Ready);
+            consecutiveFailures_ = 0;
+            lastSuccessfulConnect_ = std::chrono::steady_clock::now();
+            log("[reconstructive] Successfully reconnected with new Pixel object!");
+        }
+        else
+        {
+            setConnectionState(ConnectionState::Selected);
+            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 5);
+        }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
     }
@@ -489,8 +638,17 @@ void DieConnection::startConnectThread()
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            connecting_ = false;
-            connectedOnce_ = ok;
+            if (ok)
+            {
+                setConnectionState(ConnectionState::Ready);
+                consecutiveFailures_ = 0;
+                lastSuccessfulConnect_ = std::chrono::steady_clock::now();
+            }
+            else
+            {
+                setConnectionState(ConnectionState::Selected);
+                consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 5);
+            }
             lastAnyMessage_ = std::chrono::steady_clock::now();
             lastRollEvent_ = lastAnyMessage_;
         }
@@ -533,6 +691,17 @@ void DieConnection::notifyStateChanged() const
     if (stateObserver_)
     {
         stateObserver_();
+    }
+}
+
+void DieConnection::setConnectionState(ConnectionState newState)
+{
+    // Note: caller must hold mutex_
+    if (connectionState_ != newState)
+    {
+        log("[state] " + std::string(connectionStateToString(connectionState_)) +
+            " -> " + std::string(connectionStateToString(newState)));
+        connectionState_ = newState;
     }
 }
 

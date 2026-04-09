@@ -15,6 +15,18 @@
 #include "Systemic/Pixels/Pixel.h"
 #include "Systemic/Pixels/ScannedPixel.h"
 
+// Explicit app-level connection state (distinct from library PixelStatus)
+enum class ConnectionState
+{
+    Unselected,     // Die not yet selected from scan
+    Selected,       // Die selected, waiting for first connection
+    Connecting,     // Connection attempt in progress
+    Ready,          // Connected and operational
+    Stale,          // Connection appears dead (no messages)
+    Reconnecting,   // Attempting to reconnect after failure
+    Shutdown        // Shutting down, no more operations
+};
+
 class DieConnection
 {
 public:
@@ -37,6 +49,7 @@ public:
     bool isSelected() const;
     uint32_t targetPixelId() const;
     const std::string& label() const;
+    ConnectionState connectionState() const;
     DieStatusSnapshot snapshot() const;
 
 private:
@@ -44,14 +57,18 @@ private:
 
     std::future<Systemic::Pixels::Pixel::ConnectResult> connectAndInitialize(const std::shared_ptr<Systemic::Pixels::Pixel>& pixel);
     bool reconnectPixel();
+    bool reconstructiveReconnect();
     void startConnectThread();
     void markAnyMessage();
     void markRollEvent();
     void markRollResult(int face);
     void notifyStateChanged() const;
+    void setConnectionState(ConnectionState newState);
 
     std::string prefix() const;
     void log(const std::string& message) const;
+
+    static const char* connectionStateToString(ConnectionState state);
 
     mutable std::mutex mutex_;
 
@@ -63,24 +80,34 @@ private:
     std::shared_ptr<Systemic::Pixels::Pixel> pixel_;
     std::shared_ptr<Delegate> delegate_;
 
+    // Store ScannedPixel data for reconstructive reconnect
+    std::shared_ptr<const Systemic::Pixels::ScannedPixel> lastScannedPixel_;
+
+    // Explicit app-level state
+    ConnectionState connectionState_ = ConnectionState::Unselected;
+
     bool shuttingDown_ = false;
-    bool connecting_ = false;
-    bool connectedOnce_ = false;
-    bool selected_ = false;
     std::chrono::steady_clock::time_point lastConnectAttempt_ = std::chrono::steady_clock::now() - std::chrono::seconds(30);
 
+    // Exponential backoff for reconnection
+    int consecutiveFailures_ = 0;
+    static constexpr int kMaxBackoffSeconds = 60;
+    static constexpr int kBaseBackoffSeconds = 2;
+
+    // Stale detection parameters
+    static constexpr int kStaleTimeoutSeconds = 20;      // Time without messages before considered stale
+    static constexpr int kStaleGracePeriodSeconds = 10;  // Grace period after reconnect before checking stale
+
+    // Message timing for stale detection
     std::chrono::steady_clock::time_point lastRollEvent_ = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastAnyMessage_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastSuccessfulConnect_ = std::chrono::steady_clock::now();
+
+    // Roll tracking
     bool hasLastRoll_ = false;
     int lastRollFace_ = 0;
     std::chrono::system_clock::time_point lastRollAt_{};
     std::vector<int> recentRollFaces_;
-
-    // Track poll data to detect stale connections (cached data that doesn't change)
-    int lastPollRssi_ = 0;
-    int lastPollFace_ = 0;
-    int lastPollBattery_ = 0;
-    int identicalPollCount_ = 0;
 
     std::thread connectThread_;
 };
