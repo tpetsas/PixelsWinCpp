@@ -154,6 +154,7 @@ add_executable(PixelsTray WIN32
     App/DiceManager.cpp
     App/Runtime/PixelsRuntimeService.cpp
     App/Tray/TrayApp.cpp
+    App/Tray/TraySettings.cpp
     App/CliOptions.h
     App/ConfigManager.h
     App/DieConnection.h
@@ -161,6 +162,7 @@ add_executable(PixelsTray WIN32
     App/Runtime/RuntimeModels.h
     App/Runtime/PixelsRuntimeService.h
     App/Tray/TrayApp.h
+    App/Tray/TraySettings.h
 )
 
 target_link_libraries(PixelsTray PRIVATE PixelsLib shell32 comdlg32)

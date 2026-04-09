@@ -63,10 +63,11 @@ namespace
     {
         std::cout << "\nConnecting...";
 
-        auto result = co_await pixel->connectAsync();
+        // Use maintainConnection=true for automatic reconnection after unexpected disconnection
+        auto result = co_await pixel->connectAsync(true);
         if (result != Pixel::ConnectResult::Success)
         {
-            result = co_await pixel->connectAsync();
+            result = co_await pixel->connectAsync(true);
         }
 
         if (result == Pixel::ConnectResult::Success)

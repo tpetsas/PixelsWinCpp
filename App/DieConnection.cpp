@@ -207,10 +207,15 @@ void DieConnection::tickWatchdog()
             currentStatus = localPixel->status();
         }
 
+        const auto now = std::chrono::steady_clock::now();
+        const auto connectAge = std::chrono::duration_cast<std::chrono::seconds>(now - lastConnectAttempt_).count();
+
+        // Only handle explicit disconnection here
+        // Stale connection detection is handled in tickPoll() by checking for identical data
         if (localPixel && !connecting_ && currentStatus == PixelStatus::Disconnected)
         {
-            const auto now = std::chrono::steady_clock::now();
-            if (now - lastConnectAttempt_ >= std::chrono::seconds(5))
+            log("[watchdog] Disconnected, elapsed=" + std::to_string(connectAge) + "s since last attempt");
+            if (connectAge >= 5)
             {
                 shouldTryReconnect = true;
             }
@@ -229,6 +234,7 @@ void DieConnection::tickWatchdog()
 void DieConnection::tickPoll()
 {
     std::shared_ptr<Pixel> localPixel;
+    bool shouldReconnect = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         localPixel = pixel_;
@@ -239,10 +245,51 @@ void DieConnection::tickPoll()
         return;
     }
 
-    log("[poll] status=" + toStatusString(localPixel->status()) +
-        ", face=" + std::to_string(localPixel->currentFace()) +
+    const int currentRssi = localPixel->rssi();
+    const int currentFace = localPixel->currentFace();
+    const int currentBattery = localPixel->batteryLevel();
+    const auto currentStatus = localPixel->status();
+
+    log("[poll] status=" + toStatusString(currentStatus) +
+        ", face=" + std::to_string(currentFace) +
         ", rollState=" + std::to_string(static_cast<int>(localPixel->rollState())) +
-        ", battery=" + std::to_string(localPixel->batteryLevel()));
+        ", battery=" + std::to_string(currentBattery) +
+        ", rssi=" + std::to_string(currentRssi));
+
+    // Detect stale connection: if poll data is identical for multiple cycles,
+    // the connection is likely stale (we're reading cached data, not live data)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (connectedOnce_ && currentStatus == PixelStatus::Ready)
+        {
+            if (currentRssi == lastPollRssi_ && currentFace == lastPollFace_ && currentBattery == lastPollBattery_)
+            {
+                identicalPollCount_++;
+                // If we've seen identical data for 3+ polls (about 90 seconds with 30s poll interval),
+                // the connection is likely stale
+                if (identicalPollCount_ >= 3)
+                {
+                    log("[poll] Stale connection detected (identical data for " + std::to_string(identicalPollCount_) + " polls)");
+                    shouldReconnect = true;
+                    identicalPollCount_ = 0;
+                }
+            }
+            else
+            {
+                // Data changed, connection is alive
+                identicalPollCount_ = 0;
+            }
+            lastPollRssi_ = currentRssi;
+            lastPollFace_ = currentFace;
+            lastPollBattery_ = currentBattery;
+        }
+    }
+
+    if (shouldReconnect)
+    {
+        log("[poll] Forcing reconnection due to stale data...");
+        reconnectPixel();
+    }
 }
 
 void DieConnection::shutdown()
@@ -319,16 +366,29 @@ std::future<Pixel::ConnectResult> DieConnection::connectAndInitialize(const std:
 {
     log("Connecting...");
 
-    auto result = co_await pixel->connectAsync();
+    // Use maintainConnection=true for automatic reconnection after unexpected disconnection
+    auto result = co_await pixel->connectAsync(true);
     if (result != Pixel::ConnectResult::Success)
     {
         log("First connection attempt failed, retrying...");
-        result = co_await pixel->connectAsync();
+        result = co_await pixel->connectAsync(true);
     }
 
     if (result == Pixel::ConnectResult::Success)
     {
         log("Connected and ready to use!");
+
+        // Enable RSSI reporting so we get live RSSI updates for stale connection detection
+        try
+        {
+            co_await pixel->reportRssiAsync(true);
+            log("RSSI reporting enabled");
+        }
+        catch (...)
+        {
+            log("Failed to enable RSSI reporting");
+        }
+
         log("Roll die to see results...");
     }
     else

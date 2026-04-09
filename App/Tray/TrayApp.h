@@ -1,9 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <deque>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -11,6 +15,7 @@
 #include <shellapi.h>
 
 #include "App/Runtime/PixelsRuntimeService.h"
+#include "App/Tray/TraySettings.h"
 
 namespace Systemic::Pixels
 {
@@ -101,4 +106,51 @@ private:
     mutable std::mutex setupMutex_;
     std::map<uint32_t, SetupDiscoveredDie> setupDiscoveredById_;
     std::vector<uint32_t> setupListPixelIds_;
+
+    // Log window
+    HWND logWindowHandle_ = nullptr;
+    HWND logTextHandle_ = nullptr;
+    std::wstring logWindowClassName_ = L"PixelsTrayLogWindowClass";
+    mutable std::mutex logMutex_;
+    std::deque<std::wstring> logLines_;
+    static constexpr size_t kMaxLogLines = 100;
+
+    bool createLogWindow();
+    void showLogWindow();
+    void appendLog(const std::string& message);
+    void updateLogWindow();
+
+    // Notification system
+    static constexpr UINT_PTR kNotificationTimerId = 2;
+    static constexpr int kLowBatteryThreshold = 10;
+    static constexpr int kDisconnectWarningSeconds = 30;
+
+    bool allDiceReadyNotified_ = false;
+    std::set<uint32_t> lowBatteryNotifiedIds_;
+    std::map<uint32_t, std::chrono::steady_clock::time_point> disconnectTimestamps_;
+    std::set<uint32_t> disconnectWarningShownIds_;
+
+    void checkAndShowNotifications();
+    void showBalloonNotification(const std::wstring& title, const std::wstring& message, DWORD iconType = NIIF_INFO);
+
+    // Dice color themes (for Aurora Sky and Midnight Galaxy)
+    struct DiceTheme
+    {
+        COLORREF primaryColor;
+        COLORREF secondaryColor;
+        COLORREF textColor;
+        std::wstring displayName;
+    };
+
+    DiceTheme getDiceTheme(const std::string& label) const;
+
+    // Settings
+    TraySettings settings_;
+    std::wstring settingsPath_;
+    std::wstring logFilePath_;
+    std::ofstream logFile_;
+
+    void loadSettings();
+    void writeLogToFile(const std::wstring& message);
+    bool shouldShowLogMessage(const std::string& message) const;
 };

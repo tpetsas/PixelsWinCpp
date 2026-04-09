@@ -76,5 +76,11 @@ private:
     std::chrono::system_clock::time_point lastRollAt_{};
     std::vector<int> recentRollFaces_;
 
+    // Track poll data to detect stale connections (cached data that doesn't change)
+    int lastPollRssi_ = 0;
+    int lastPollFace_ = 0;
+    int lastPollBattery_ = 0;
+    int identicalPollCount_ = 0;
+
     std::thread connectThread_;
 };
