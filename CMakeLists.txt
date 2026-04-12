@@ -67,6 +67,7 @@ if(MSVC)
         /permissive-
         /bigobj
         /await
+        /FS
         /W4
     )
 endif()
@@ -111,6 +112,7 @@ if(MSVC)
         /permissive-
         /bigobj
         /await
+        /FS
         /W4
     )
 endif()
@@ -180,6 +182,8 @@ if(MSVC)
         /permissive-
         /bigobj
         /await
+        /FS
+        /Z7
         /W4
     )
 endif()

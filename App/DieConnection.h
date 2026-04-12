@@ -74,6 +74,7 @@ private:
     static const char* connectionStateToString(ConnectionState state);
 
     mutable std::mutex mutex_;
+    std::mutex bleOpMutex_;  // Serializes BLE operations (connect/disconnect/reconnect)
 
     const uint32_t targetPixelId_;
     const std::string label_;

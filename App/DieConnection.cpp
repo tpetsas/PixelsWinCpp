@@ -389,12 +389,18 @@ void DieConnection::tickPoll()
 
 void DieConnection::shutdown()
 {
-    std::shared_ptr<Pixel> localPixel;
-
     {
         std::lock_guard<std::mutex> lock(mutex_);
         shuttingDown_ = true;
         setConnectionState(ConnectionState::Shutdown);
+    }
+
+    // Wait for any in-progress BLE operation to finish before disconnecting
+    std::lock_guard<std::mutex> bleLock(bleOpMutex_);
+
+    std::shared_ptr<Pixel> localPixel;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         localPixel = pixel_;
     }
 
@@ -581,6 +587,13 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
 
 bool DieConnection::reconnectPixel()
 {
+    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    if (!bleLock.owns_lock())
+    {
+        log("[reconnect] BLE operation already in progress, skipping");
+        return false;
+    }
+
     std::shared_ptr<Pixel> localPixel;
 
     {
@@ -650,6 +663,13 @@ bool DieConnection::reconnectPixel()
 
 bool DieConnection::reconstructiveReconnect()
 {
+    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    if (!bleLock.owns_lock())
+    {
+        log("[reconstructive] BLE operation already in progress, skipping");
+        return false;
+    }
+
     std::shared_ptr<Pixel> oldPixel;
     std::shared_ptr<const ScannedPixel> scannedPixel;
 
@@ -743,6 +763,13 @@ void DieConnection::startConnectThread()
 
     connectThread_ = std::thread([this]()
     {
+        std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+        if (!bleLock.owns_lock())
+        {
+            log("[connect] BLE operation already in progress, skipping");
+            return;
+        }
+
         bool ok = false;
 
         try
