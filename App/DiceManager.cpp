@@ -53,11 +53,15 @@ void DiceManager::start()
             {
                 stopScanner();
                 stopScanRequested_ = false;
+                recoveryScanActive_ = false;
                 if (logger_)
                 {
                     logger_("\nStopped scanning after selecting configured dice.");
                 }
             }
+
+            checkRecoveryScan();
+
             std::this_thread::sleep_for(200ms);
         }
     });
@@ -275,6 +279,87 @@ void DiceManager::stopScanner()
     {
         stateObserver_();
     }
+}
+
+void DiceManager::checkRecoveryScan()
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    // If a recovery scan is active, check if we should stop it
+    if (recoveryScanActive_)
+    {
+        bool stillNeedsRecovery = false;
+        for (const auto& die : dice_)
+        {
+            if (die->needsRecoveryScan())
+            {
+                stillNeedsRecovery = true;
+                break;
+            }
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - recoveryScanStartTime_).count();
+
+        if (!stillNeedsRecovery)
+        {
+            if (logger_)
+            {
+                logger_("\n[recovery] Recovery scan: die re-discovered, stopping scanner.");
+            }
+            stopScanner();
+            recoveryScanActive_ = false;
+            lastRecoveryScanEnd_ = now;
+        }
+        else if (elapsed >= kRecoveryScanDurationSeconds)
+        {
+            if (logger_)
+            {
+                logger_("\n[recovery] Recovery scan timeout (" + std::to_string(elapsed) + "s), stopping scanner.");
+            }
+            stopScanner();
+            recoveryScanActive_ = false;
+            lastRecoveryScanEnd_ = now;
+        }
+
+        return;
+    }
+
+    // Check if any die needs a recovery scan
+    if (isScanning())
+    {
+        return;  // Initial scan still running
+    }
+
+    bool needsRecovery = false;
+    for (const auto& die : dice_)
+    {
+        if (die->needsRecoveryScan())
+        {
+            needsRecovery = true;
+            break;
+        }
+    }
+
+    if (!needsRecovery)
+    {
+        return;
+    }
+
+    // Cooldown: don't start recovery scans too frequently
+    const auto cooldown = std::chrono::duration_cast<std::chrono::seconds>(now - lastRecoveryScanEnd_).count();
+    if (cooldown < kRecoveryScanCooldownSeconds)
+    {
+        return;
+    }
+
+    if (logger_)
+    {
+        logger_("\n[recovery] Starting recovery scan for disconnected dice...");
+    }
+
+    startScanner();
+    recoveryScanActive_ = true;
+    recoveryScanStartTime_ = now;
 }
 
 bool DiceManager::allDiceSelected() const

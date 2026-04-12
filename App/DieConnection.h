@@ -47,6 +47,7 @@ public:
     void shutdown();
 
     bool isSelected() const;
+    bool needsRecoveryScan() const;
     uint32_t targetPixelId() const;
     const std::string& label() const;
     ConnectionState connectionState() const;
@@ -56,6 +57,8 @@ private:
     class Delegate;
 
     std::future<Systemic::Pixels::Pixel::ConnectResult> connectAndInitialize(const std::shared_ptr<Systemic::Pixels::Pixel>& pixel);
+    void onPixelDisconnected();
+    void checkMissedRoll(const std::shared_ptr<Systemic::Pixels::Pixel>& pixel);
     bool reconnectPixel();
     bool reconstructiveReconnect();
     void startConnectThread();
@@ -91,8 +94,10 @@ private:
 
     // Exponential backoff for reconnection
     int consecutiveFailures_ = 0;
-    static constexpr int kMaxBackoffSeconds = 60;
+    static constexpr int kMaxBackoffSeconds = 15;
     static constexpr int kBaseBackoffSeconds = 2;
+    static constexpr int kRecoveryScanThreshold = 4;  // Failures before requesting recovery scan
+    std::atomic<bool> immediateReconnectRequested_{false};
 
     // Stale detection parameters
     static constexpr int kStaleTimeoutSeconds = 20;      // Time without messages before considered stale
@@ -104,6 +109,8 @@ private:
     std::chrono::steady_clock::time_point lastSuccessfulConnect_ = std::chrono::steady_clock::now();
 
     // Roll tracking
+    int faceBeforeDisconnect_ = 0;  // Saved on disconnect, used to detect missed rolls after reconnect
+    Systemic::Pixels::PixelRollState rollStateBeforeDisconnect_ = Systemic::Pixels::PixelRollState::Unknown;  // Saved on disconnect
     bool hasLastRoll_ = false;
     int lastRollFace_ = 0;
     std::chrono::system_clock::time_point lastRollAt_{};

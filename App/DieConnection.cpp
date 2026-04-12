@@ -74,6 +74,13 @@ public:
     {
         owner_->log("Status changed to " + toStatusString(status));
         owner_->markAnyMessage();
+
+        // Event-driven reconnect: immediately flag when the die disconnects
+        // so the watchdog can act on the next tick without waiting for backoff
+        if (status == PixelStatus::Disconnected)
+        {
+            owner_->onPixelDisconnected();
+        }
     }
 
     void onFirmwareDateChanged(std::shared_ptr<Pixel> /*pixel*/, std::chrono::system_clock::time_point firmwareDate) override
@@ -155,23 +162,38 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
 
     bool shouldConnect = false;
     bool firstSelection = false;
+    bool recoveryRediscovery = false;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        if (shuttingDown_ || connectionState_ == ConnectionState::Connecting ||
+        if (shuttingDown_)
+        {
+            return false;
+        }
+
+        // Always update ScannedPixel data when ID matches,
+        // even during Reconnecting — the next reconnect attempt will use fresh data
+        lastScannedPixel_ = scannedPixel;
+
+        if (connectionState_ == ConnectionState::Connecting ||
             connectionState_ == ConnectionState::Reconnecting)
         {
             return false;
         }
 
-        // Store ScannedPixel for potential reconstructive reconnect later
-        lastScannedPixel_ = scannedPixel;
-
         if (connectionState_ == ConnectionState::Unselected)
         {
             setConnectionState(ConnectionState::Selected);
             firstSelection = true;
+        }
+
+        // Recovery re-discovery: die was already selected but disconnected with many failures.
+        // Request immediate reconnect with the fresh ScannedPixel data.
+        if (connectionState_ == ConnectionState::Selected && pixel_ && consecutiveFailures_ >= 2)
+        {
+            recoveryRediscovery = true;
+            immediateReconnectRequested_.store(true);
         }
 
         if (!pixel_)
@@ -183,6 +205,12 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
             lastRollEvent_ = lastAnyMessage_;
             shouldConnect = true;
         }
+    }
+
+    if (recoveryRediscovery)
+    {
+        log("[recovery] Re-discovered via scan (RSSI: " + std::to_string(scannedPixel->rssi()) +
+            "), requesting immediate reconnect with fresh data");
     }
 
     if (firstSelection)
@@ -208,6 +236,13 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
     notifyStateChanged();
 
     return shouldConnect;
+}
+
+bool DieConnection::needsRecoveryScan() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connectionState_ == ConnectionState::Selected &&
+           consecutiveFailures_ >= kRecoveryScanThreshold;
 }
 
 void DieConnection::tickWatchdog()
@@ -239,17 +274,20 @@ void DieConnection::tickWatchdog()
         const auto now = std::chrono::steady_clock::now();
         const auto connectAge = std::chrono::duration_cast<std::chrono::seconds>(now - lastConnectAttempt_).count();
 
-        // Calculate exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s (max)
+        // Calculate exponential backoff: 2s, 4s, 8s, 15s (max)
         backoffSeconds = std::min(kMaxBackoffSeconds, kBaseBackoffSeconds * (1 << consecutiveFailures_));
 
         // Handle explicit disconnection
         if (localPixel && currentStatus == PixelStatus::Disconnected)
         {
+            const bool immediate = immediateReconnectRequested_.exchange(false);
+
             log("[watchdog] Disconnected, elapsed=" + std::to_string(connectAge) +
                 "s since last attempt (backoff=" + std::to_string(backoffSeconds) +
-                "s, failures=" + std::to_string(consecutiveFailures_) + ")");
+                "s, failures=" + std::to_string(consecutiveFailures_) +
+                (immediate ? ", immediate" : "") + ")");
 
-            if (connectAge >= backoffSeconds)
+            if (immediate || connectAge >= backoffSeconds)
             {
                 shouldTryReconnect = true;
             }
@@ -335,6 +373,15 @@ void DieConnection::tickPoll()
     if (shouldReconnect)
     {
         log("[poll] Forcing reconnection due to stale connection...");
+        // Save face and roll state before stale reconnect for missed-roll detection
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (localPixel)
+            {
+                faceBeforeDisconnect_ = localPixel->currentFace();
+                rollStateBeforeDisconnect_ = localPixel->rollState();
+            }
+        }
         // Use reconstructive reconnect for stale connections
         reconstructiveReconnect();
     }
@@ -424,12 +471,14 @@ std::future<Pixel::ConnectResult> DieConnection::connectAndInitialize(const std:
 {
     log("Connecting...");
 
-    // Use maintainConnection=true for automatic reconnection after unexpected disconnection
-    auto result = co_await pixel->connectAsync(true);
+    // Use maintainConnection=false so link-loss fires a proper Disconnected event
+    // instead of silently losing GATT subscriptions during WinRT auto-reconnect.
+    // Our own watchdog / event-driven reconnect handles recovery explicitly.
+    auto result = co_await pixel->connectAsync(false);
     if (result != Pixel::ConnectResult::Success)
     {
         log("First connection attempt failed, retrying...");
-        result = co_await pixel->connectAsync(true);
+        result = co_await pixel->connectAsync(false);
     }
 
     if (result == Pixel::ConnectResult::Success)
@@ -455,6 +504,79 @@ std::future<Pixel::ConnectResult> DieConnection::connectAndInitialize(const std:
     }
 
     co_return result;
+}
+
+void DieConnection::onPixelDisconnected()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Only act if we were in a connected state
+    if (connectionState_ != ConnectionState::Ready &&
+        connectionState_ != ConnectionState::Stale)
+    {
+        return;
+    }
+
+    // Save current face and roll state so we can detect missed rolls after reconnect
+    if (pixel_)
+    {
+        faceBeforeDisconnect_ = pixel_->currentFace();
+        rollStateBeforeDisconnect_ = pixel_->rollState();
+    }
+
+    log("[event] Disconnect detected — requesting immediate reconnect (face=" +
+        std::to_string(faceBeforeDisconnect_) + ", rollState=" +
+        std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) + ")");
+    setConnectionState(ConnectionState::Selected);
+    immediateReconnectRequested_.store(true);
+}
+
+void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
+{
+    int savedFace;
+    PixelRollState savedRollState;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        savedFace = faceBeforeDisconnect_;
+        savedRollState = rollStateBeforeDisconnect_;
+        faceBeforeDisconnect_ = 0;  // Reset so we don't double-count
+        rollStateBeforeDisconnect_ = PixelRollState::Unknown;
+    }
+
+    if (!pixel || savedFace == 0)
+    {
+        return;
+    }
+
+    const int newFace = pixel->currentFace();
+    const auto currentRollState = pixel->rollState();
+
+    const bool wasRolling = (savedRollState == PixelRollState::Rolling ||
+                             savedRollState == PixelRollState::Handling);
+    const bool isAtRest = (currentRollState != PixelRollState::Rolling);
+
+    // Case 1: Die was mid-roll at disconnect time. Any settled face after
+    // reconnect is the result of that roll, even if it coincidentally matches
+    // the transient face we last saw while tumbling.
+    if (wasRolling && isAtRest)
+    {
+        log("[missed-roll] Die was rolling at disconnect (face=" + std::to_string(savedFace) +
+            ", rollState=" + std::to_string(static_cast<int>(savedRollState)) +
+            ") -> landed on " + std::to_string(newFace) +
+            " (rollState=" + std::to_string(static_cast<int>(currentRollState)) + ")");
+        markRollResult(newFace);
+        return;
+    }
+
+    // Case 2: Die was at rest at disconnect time but face changed —
+    // it was rolled and settled during the disconnect window.
+    if (!wasRolling && newFace != savedFace && isAtRest)
+    {
+        log("[missed-roll] Face changed from " + std::to_string(savedFace) +
+            " to " + std::to_string(newFace) + " during disconnect (rollState=" +
+            std::to_string(static_cast<int>(currentRollState)) + ")");
+        markRollResult(newFace);
+    }
 }
 
 bool DieConnection::reconnectPixel()
@@ -499,6 +621,11 @@ bool DieConnection::reconnectPixel()
         log("[reconnect] Unknown exception.");
     }
 
+    if (ok)
+    {
+        checkMissedRoll(localPixel);
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (ok)
@@ -510,7 +637,7 @@ bool DieConnection::reconnectPixel()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 5); // Cap at 5 (64s max backoff)
+            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 4); // Cap at 4 (max ~15s backoff)
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
@@ -579,6 +706,11 @@ bool DieConnection::reconstructiveReconnect()
         log("[reconstructive] Unknown exception.");
     }
 
+    if (ok)
+    {
+        checkMissedRoll(newPixel);
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (ok)
@@ -591,7 +723,7 @@ bool DieConnection::reconstructiveReconnect()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 5);
+            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 4);
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
@@ -625,6 +757,11 @@ void DieConnection::startConnectThread()
             {
                 const auto result = connectAndInitialize(localPixel).get();
                 ok = (result == Pixel::ConnectResult::Success);
+
+                if (ok)
+                {
+                    checkMissedRoll(localPixel);
+                }
             }
         }
         catch (const std::exception& ex)
@@ -647,7 +784,7 @@ void DieConnection::startConnectThread()
             else
             {
                 setConnectionState(ConnectionState::Selected);
-                consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 5);
+                consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 4);
             }
             lastAnyMessage_ = std::chrono::steady_clock::now();
             lastRollEvent_ = lastAnyMessage_;
