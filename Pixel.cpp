@@ -15,37 +15,58 @@ namespace Systemic::Pixels
         : _data(scannedPixel.data)
         , _peripheral(Peripheral::create(scannedPixel.data.address, [this](ConnectionEvent ev, ConnectionEventReason /*reason*/)
             {
-                std::lock_guard lock{ _mutex };
+                bool shouldNotify = false;
+                PixelStatus newStatus{};
 
-                switch (ev)
                 {
-                case ConnectionEvent::Connecting:
-                    _status = PixelStatus::Connecting;
-                    break;
-                case ConnectionEvent::Disconnecting:
-                    _status = PixelStatus::Disconnecting;
-                    break;
-                case ConnectionEvent::Disconnected:
-                case ConnectionEvent::FailedToConnect:
-                    _status = PixelStatus::Disconnected;
-                    break;
-                case ConnectionEvent::Connected:
-                case ConnectionEvent::Ready:
-                    // Nothing
-                    break;
+                    std::lock_guard lock{ _mutex };
+
+                    switch (ev)
+                    {
+                    case ConnectionEvent::Connecting:
+                        _status = PixelStatus::Connecting;
+                        break;
+                    case ConnectionEvent::Disconnecting:
+                        _status = PixelStatus::Disconnecting;
+                        break;
+                    case ConnectionEvent::Disconnected:
+                    case ConnectionEvent::FailedToConnect:
+                        _status = PixelStatus::Disconnected;
+                        shouldNotify = true;
+                        break;
+                    case ConnectionEvent::Connected:
+                    case ConnectionEvent::Ready:
+                        // Nothing
+                        break;
+                    }
+                    newStatus = _status;
+                }
+
+                // Notify delegate outside lock to avoid deadlocks,
+                // matching the pattern in updateStatus()
+                if (shouldNotify)
+                {
+                    for (const auto& cb : _internalStatusCbs.get())
+                    {
+                        if (cb) cb(newStatus);
+                    }
+                    if (_delegate)
+                    {
+                        _delegate->onStatusChanged(shared_from_this(), newStatus);
+                    }
                 }
             }))
         , _delegate(delegate)
     {
     }
 
-            std::future<Pixel::ConnectResult> Pixel::connectAsync()
+            std::future<Pixel::ConnectResult> Pixel::connectAsync(bool maintainConnection)
             {
                 auto result = ConnectResult::Success;
 
                 try
                 {
-                    const auto connectStatus = co_await _peripheral->connectAsync({ PixelBleUuids::service });
+                    const auto connectStatus = co_await _peripheral->connectAsync({ PixelBleUuids::service }, maintainConnection);
 
                     if (connectStatus == BleRequestStatus::Success)
                     {

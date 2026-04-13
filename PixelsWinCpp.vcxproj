@@ -101,6 +101,12 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="App\CliOptions.h" />
+    <ClInclude Include="App\ConfigManager.h" />
+    <ClInclude Include="App\DieConnection.h" />
+    <ClInclude Include="App\DiceManager.h" />
+    <ClInclude Include="App\Runtime\RuntimeModels.h" />
+    <ClInclude Include="App\Runtime\PixelsRuntimeService.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Systemic\BluetoothLE\BleTypes.h" />
     <ClInclude Include="Systemic\BluetoothLE\BluetoothLE.h" />
@@ -124,9 +130,14 @@
     <ClInclude Include="Systemic\Pixels\ScannedPixel.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="App\CliOptions.cpp" />
+    <ClCompile Include="App\ConfigManager.cpp" />
+    <ClCompile Include="App\DieConnection.cpp" />
+    <ClCompile Include="App\DiceManager.cpp" />
+    <ClCompile Include="App\Runtime\PixelsRuntimeService.cpp" />
+    <ClCompile Include="app_main.cpp" />
     <ClCompile Include="BluetoothLE.cpp" />
     <ClCompile Include="ComHelper.cpp" />
-    <ClCompile Include="main.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
@@ -137,6 +148,7 @@
     <ClCompile Include="PixelScanner.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="main.cpp" />
     <None Include="packages.config" />
     <None Include="PropertySheet.props" />
     <None Include="README.md" />

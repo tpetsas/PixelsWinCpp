@@ -1,0 +1,3 @@
+#include "App/Tray/TrayResources.h"
+
+IDI_D20_APP_ICON ICON "assets\\d20.ico"
