@@ -48,10 +48,18 @@ public:
 
     bool isSelected() const;
     bool needsRecoveryScan() const;
+    bool needsFullBleReset() const;
     uint32_t targetPixelId() const;
     const std::string& label() const;
     ConnectionState connectionState() const;
+    int consecutiveFailures() const;
+    std::chrono::steady_clock::time_point lastSuccessfulConnect() const;
     DieStatusSnapshot snapshot() const;
+
+    // Adapter contention management
+    void forceReleaseConnection();
+    void requestPriorityReconnect();
+    void suspendReconnectUntil(std::chrono::steady_clock::time_point until);
 
 private:
     class Delegate;
@@ -98,7 +106,9 @@ private:
     static constexpr int kMaxBackoffSeconds = 15;
     static constexpr int kBaseBackoffSeconds = 2;
     static constexpr int kRecoveryScanThreshold = 4;  // Failures before requesting recovery scan
+    static constexpr int kFullBleResetThreshold = 5;   // Failures before full BLE reset (disconnect all dice)
     std::atomic<bool> immediateReconnectRequested_{false};
+    std::chrono::steady_clock::time_point reconnectSuspendedUntil_{};  // DiceManager sets this during BLE reset
 
     // Stale detection parameters
     static constexpr int kStaleTimeoutSeconds = 20;      // Time without messages before considered stale

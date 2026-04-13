@@ -245,6 +245,13 @@ bool DieConnection::needsRecoveryScan() const
            consecutiveFailures_ >= kRecoveryScanThreshold;
 }
 
+bool DieConnection::needsFullBleReset() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connectionState_ == ConnectionState::Selected &&
+           consecutiveFailures_ >= kFullBleResetThreshold;
+}
+
 void DieConnection::tickWatchdog()
 {
     std::shared_ptr<Pixel> localPixel;
@@ -267,6 +274,12 @@ void DieConnection::tickWatchdog()
             currentConnState == ConnectionState::Reconnecting ||
             currentConnState == ConnectionState::Shutdown ||
             currentConnState == ConnectionState::Unselected)
+        {
+            return;
+        }
+
+        // Reconnection suspended by DiceManager (e.g., during full BLE reset)
+        if (std::chrono::steady_clock::now() < reconnectSuspendedUntil_)
         {
             return;
         }
@@ -299,10 +312,12 @@ void DieConnection::tickWatchdog()
         return;
     }
 
-    // After multiple failures, try reconstructive reconnect (destroy and recreate Pixel)
-    if (consecutiveFailures_ >= 2)
+    // After the first failed reconnectPixel (which already tried 3× internally),
+    // switch to reconstructive reconnect — destroy and recreate Pixel to clear
+    // BLE stack cached state. This saves ~30s of futile regular retries.
+    if (consecutiveFailures_ >= 1)
     {
-        log("[watchdog] Multiple failures, trying reconstructive reconnect...");
+        log("[watchdog] Prior failure, trying reconstructive reconnect...");
         reconstructiveReconnect();
     }
     else
@@ -431,6 +446,90 @@ ConnectionState DieConnection::connectionState() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return connectionState_;
+}
+
+int DieConnection::consecutiveFailures() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return consecutiveFailures_;
+}
+
+std::chrono::steady_clock::time_point DieConnection::lastSuccessfulConnect() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lastSuccessfulConnect_;
+}
+
+void DieConnection::forceReleaseConnection()
+{
+    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    if (!bleLock.owns_lock())
+    {
+        log("[adapter] BLE operation in progress, cannot release");
+        return;
+    }
+
+    std::shared_ptr<Pixel> localPixel;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (connectionState_ == ConnectionState::Ready ||
+            connectionState_ == ConnectionState::Stale)
+        {
+            localPixel = pixel_;
+            // Save state for missed-roll detection
+            if (localPixel)
+            {
+                faceBeforeDisconnect_ = localPixel->currentFace();
+                rollStateBeforeDisconnect_ = localPixel->rollState();
+            }
+            setConnectionState(ConnectionState::Selected);
+            // Give this die a small backoff so the failing die gets priority
+            lastConnectAttempt_ = std::chrono::steady_clock::now();
+            consecutiveFailures_ = 1;
+        }
+        else if (connectionState_ == ConnectionState::Selected)
+        {
+            // Already disconnected but stuck — reset failures for fresh start
+            // Keep pixel_ alive so the watchdog can still attempt reconnection
+            consecutiveFailures_ = 0;
+            lastConnectAttempt_ = std::chrono::steady_clock::now();
+            immediateReconnectRequested_.store(true);
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    log("[adapter] Releasing connection to free BLE adapter (face=" +
+        std::to_string(faceBeforeDisconnect_) + ")");
+
+    if (localPixel)
+    {
+        try
+        {
+            localPixel->disconnect();
+        }
+        catch (...)
+        {
+        }
+    }
+
+    notifyStateChanged();
+}
+
+void DieConnection::requestPriorityReconnect()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    immediateReconnectRequested_.store(true);
+    log("[adapter] Priority reconnect requested (failures=" +
+        std::to_string(consecutiveFailures_) + ")");
+}
+
+void DieConnection::suspendReconnectUntil(std::chrono::steady_clock::time_point until)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    reconnectSuspendedUntil_ = until;
 }
 
 DieStatusSnapshot DieConnection::snapshot() const
@@ -609,29 +708,52 @@ bool DieConnection::reconnectPixel()
         localPixel = pixel_;
     }
 
-    log("[reconnect] Disconnecting and reconnecting same Pixel object...");
-
-    try
-    {
-        localPixel->disconnect();
-    }
-    catch (...)
-    {
-    }
+    // Retry loop: try up to 3 times with 2s delays between attempts.
+    // This is much faster than going back to the watchdog (which adds 4-15s backoff each time).
+    static constexpr int kReconnectRetries = 3;
+    static constexpr int kRetryDelaySeconds = 2;
 
     bool ok = false;
-    try
+    for (int attempt = 0; attempt < kReconnectRetries && !ok; ++attempt)
     {
-        const auto result = connectAndInitialize(localPixel).get();
-        ok = (result == Pixel::ConnectResult::Success);
-    }
-    catch (const std::exception& ex)
-    {
-        log(std::string("[reconnect] Exception: ") + ex.what());
-    }
-    catch (...)
-    {
-        log("[reconnect] Unknown exception.");
+        if (attempt == 0)
+        {
+            log("[reconnect] Disconnecting and reconnecting same Pixel object...");
+        }
+        else
+        {
+            log("[reconnect] Retry " + std::to_string(attempt) + "/" +
+                std::to_string(kReconnectRetries - 1) + " after " +
+                std::to_string(kRetryDelaySeconds) + "s delay...");
+            std::this_thread::sleep_for(std::chrono::seconds(kRetryDelaySeconds));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (shuttingDown_) return false;
+        }
+
+        try
+        {
+            localPixel->disconnect();
+        }
+        catch (...)
+        {
+        }
+
+        try
+        {
+            const auto result = connectAndInitialize(localPixel).get();
+            ok = (result == Pixel::ConnectResult::Success);
+        }
+        catch (const std::exception& ex)
+        {
+            log(std::string("[reconnect] Exception: ") + ex.what());
+        }
+        catch (...)
+        {
+            log("[reconnect] Unknown exception.");
+        }
     }
 
     if (ok)
@@ -650,7 +772,7 @@ bool DieConnection::reconnectPixel()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 4); // Cap at 4 (max ~15s backoff)
+            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
@@ -699,6 +821,16 @@ bool DieConnection::reconstructiveReconnect()
         catch (...)
         {
         }
+        oldPixel.reset();
+    }
+
+    // Give BLE stack time to clean up cached state for this address
+    log("[reconstructive] Waiting 1s for BLE stack cleanup...");
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shuttingDown_) return false;
     }
 
     // Create new Pixel from stored ScannedPixel data
@@ -711,19 +843,50 @@ bool DieConnection::reconstructiveReconnect()
         lastRollEvent_ = lastAnyMessage_;
     }
 
+    // Retry loop: try up to 3 times with 2s delays, same as reconnectPixel.
+    static constexpr int kReconstructiveRetries = 3;
+    static constexpr int kReconstructiveRetryDelaySeconds = 2;
+
     bool ok = false;
-    try
+    for (int attempt = 0; attempt < kReconstructiveRetries && !ok; ++attempt)
     {
-        const auto result = connectAndInitialize(newPixel).get();
-        ok = (result == Pixel::ConnectResult::Success);
-    }
-    catch (const std::exception& ex)
-    {
-        log(std::string("[reconstructive] Exception: ") + ex.what());
-    }
-    catch (...)
-    {
-        log("[reconstructive] Unknown exception.");
+        if (attempt > 0)
+        {
+            log("[reconstructive] Retry " + std::to_string(attempt) + "/" +
+                std::to_string(kReconstructiveRetries - 1) + " after " +
+                std::to_string(kReconstructiveRetryDelaySeconds) + "s delay...");
+            std::this_thread::sleep_for(std::chrono::seconds(kReconstructiveRetryDelaySeconds));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (shuttingDown_) return false;
+        }
+
+        try
+        {
+            if (attempt > 0)
+            {
+                newPixel->disconnect();
+            }
+        }
+        catch (...)
+        {
+        }
+
+        try
+        {
+            const auto result = connectAndInitialize(newPixel).get();
+            ok = (result == Pixel::ConnectResult::Success);
+        }
+        catch (const std::exception& ex)
+        {
+            log(std::string("[reconstructive] Exception: ") + ex.what());
+        }
+        catch (...)
+        {
+            log("[reconstructive] Unknown exception.");
+        }
     }
 
     if (ok)
@@ -743,7 +906,7 @@ bool DieConnection::reconstructiveReconnect()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 4);
+            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
@@ -861,6 +1024,10 @@ void DieConnection::notifyStateChanged() const
 void DieConnection::setConnectionState(ConnectionState newState)
 {
     // Note: caller must hold mutex_
+    if (connectionState_ == ConnectionState::Shutdown && newState != ConnectionState::Shutdown)
+    {
+        return;  // Never leave Shutdown state
+    }
     if (connectionState_ != newState)
     {
         log("[state] " + std::string(connectionStateToString(connectionState_)) +
