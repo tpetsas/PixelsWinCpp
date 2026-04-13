@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -41,6 +42,9 @@ public:
 private:
     void startScanner();
     void stopScanner();
+    void checkRecoveryScan();
+    void checkAdapterContention();
+    void checkFullBleReset();
     bool allDiceSelected() const;
     std::string configuredDiceText() const;
 
@@ -53,6 +57,24 @@ private:
 
     std::atomic<bool> inputDone_ = false;
     std::atomic<bool> stopScanRequested_ = false;
+
+    // Adapter contention — release a connected die when another is failing repeatedly
+    std::chrono::steady_clock::time_point lastAdapterRelease_ = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+    static constexpr int kAdapterContentionThreshold = 2;
+    static constexpr int kAdapterReleaseCooldownSeconds = 30;
+    static constexpr int kAdapterReleaseGracePeriodSeconds = 15;
+
+    // Full BLE reset — disconnect everything when a die is hopelessly stuck
+    std::chrono::steady_clock::time_point lastFullBleReset_ = std::chrono::steady_clock::now() - std::chrono::seconds(120);
+    static constexpr int kFullBleResetCooldownSeconds = 60;
+    static constexpr int kFullBleResetDelaySeconds = 3;
+
+    // Recovery scanning
+    bool recoveryScanActive_ = false;
+    std::chrono::steady_clock::time_point recoveryScanStartTime_{};
+    std::chrono::steady_clock::time_point lastRecoveryScanEnd_ = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+    static constexpr int kRecoveryScanDurationSeconds = 10;
+    static constexpr int kRecoveryScanCooldownSeconds = 20;
 
     std::thread inputThread_;
     std::thread maintenanceThread_;

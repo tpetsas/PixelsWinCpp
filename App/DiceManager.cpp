@@ -53,11 +53,20 @@ void DiceManager::start()
             {
                 stopScanner();
                 stopScanRequested_ = false;
+                recoveryScanActive_ = false;
                 if (logger_)
                 {
                     logger_("\nStopped scanning after selecting configured dice.");
                 }
             }
+
+            checkRecoveryScan();
+            // Contention disabled — releasing a healthy die when the adapter is
+            // poisoned just makes both dice stuck.  Full BLE reset is the
+            // correct recovery mechanism.
+            // checkAdapterContention();
+            checkFullBleReset();
+
             std::this_thread::sleep_for(200ms);
         }
     });
@@ -275,6 +284,231 @@ void DiceManager::stopScanner()
     {
         stateObserver_();
     }
+}
+
+void DiceManager::checkRecoveryScan()
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    // If a recovery scan is active, check if we should stop it
+    if (recoveryScanActive_)
+    {
+        bool stillNeedsRecovery = false;
+        for (const auto& die : dice_)
+        {
+            if (die->needsRecoveryScan())
+            {
+                stillNeedsRecovery = true;
+                break;
+            }
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - recoveryScanStartTime_).count();
+
+        if (!stillNeedsRecovery)
+        {
+            if (logger_)
+            {
+                logger_("\n[recovery] Recovery scan: die re-discovered, stopping scanner.");
+            }
+            stopScanner();
+            recoveryScanActive_ = false;
+            lastRecoveryScanEnd_ = now;
+        }
+        else if (elapsed >= kRecoveryScanDurationSeconds)
+        {
+            if (logger_)
+            {
+                logger_("\n[recovery] Recovery scan timeout (" + std::to_string(elapsed) + "s), stopping scanner.");
+            }
+            stopScanner();
+            recoveryScanActive_ = false;
+            lastRecoveryScanEnd_ = now;
+        }
+
+        return;
+    }
+
+    // Check if any die needs a recovery scan
+    if (isScanning())
+    {
+        return;  // Initial scan still running
+    }
+
+    bool needsRecovery = false;
+    for (const auto& die : dice_)
+    {
+        if (die->needsRecoveryScan())
+        {
+            needsRecovery = true;
+            break;
+        }
+    }
+
+    if (!needsRecovery)
+    {
+        return;
+    }
+
+    // Cooldown: don't start recovery scans too frequently
+    const auto cooldown = std::chrono::duration_cast<std::chrono::seconds>(now - lastRecoveryScanEnd_).count();
+    if (cooldown < kRecoveryScanCooldownSeconds)
+    {
+        return;
+    }
+
+    if (logger_)
+    {
+        logger_("\n[recovery] Starting recovery scan for disconnected dice...");
+    }
+
+    startScanner();
+    recoveryScanActive_ = true;
+    recoveryScanStartTime_ = now;
+}
+
+void DiceManager::checkAdapterContention()
+{
+    // Look for a die that is failing repeatedly while another is connected.
+    // This pattern suggests the BLE adapter can't handle the load, so we
+    // temporarily release the healthy die to free adapter resources.
+    DieConnection* failingDie = nullptr;
+    DieConnection* connectedDie = nullptr;
+
+    for (auto& die : dice_)
+    {
+        const auto state = die->connectionState();
+        const int failures = die->consecutiveFailures();
+
+        if (failures >= kAdapterContentionThreshold && state == ConnectionState::Selected)
+        {
+            failingDie = die.get();
+        }
+        else if (state == ConnectionState::Ready)
+        {
+            connectedDie = die.get();
+        }
+    }
+
+    if (!failingDie || !connectedDie)
+    {
+        return;
+    }
+
+    // If the failing die qualifies for recovery scanning, the problem is
+    // deeper than adapter contention — stop releasing the healthy die
+    // and let recovery scanning find fresh advertisement data instead
+    if (failingDie->needsRecoveryScan())
+    {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastAdapterRelease_).count();
+    if (elapsed < kAdapterReleaseCooldownSeconds)
+    {
+        return;
+    }
+
+    // Don't release a die that just reconnected — prevents yo-yo where
+    // contention immediately tears down a die that just recovered
+    const auto connectedFor = std::chrono::duration_cast<std::chrono::seconds>(
+        now - connectedDie->lastSuccessfulConnect()).count();
+    if (connectedFor < kAdapterReleaseGracePeriodSeconds)
+    {
+        return;
+    }
+
+    if (logger_)
+    {
+        logger_("\n[contention] " + failingDie->label() + " has " +
+                std::to_string(failingDie->consecutiveFailures()) +
+                " failures while " + connectedDie->label() +
+                " is connected (" + std::to_string(connectedFor) +
+                "s) — releasing to free BLE adapter");
+    }
+
+    connectedDie->forceReleaseConnection();
+    failingDie->requestPriorityReconnect();
+    lastAdapterRelease_ = now;
+}
+
+void DiceManager::checkFullBleReset()
+{
+    // When a die has been failing for a very long time (5+ failures),
+    // normal reconnection and recovery scanning haven't helped.
+    // The Windows BLE stack has likely cached bad state for this device.
+    // Nuclear option: disconnect ALL dice, wait, and restart one at a time.
+    bool needsReset = false;
+    for (const auto& die : dice_)
+    {
+        if (die->needsFullBleReset())
+        {
+            needsReset = true;
+            break;
+        }
+    }
+
+    if (!needsReset)
+    {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastFullBleReset_).count();
+    if (elapsed < kFullBleResetCooldownSeconds)
+    {
+        return;
+    }
+
+    if (logger_)
+    {
+        logger_("\n[RESET] BLE adapter appears stuck — disconnecting ALL dice and restarting connections");
+    }
+
+    // CRITICAL: Suspend ALL watchdog reconnection for the duration of the reset + stagger.
+    // Without this, the watchdog starts reconnecting during the 3s cleanup window.
+    const auto totalSuspendTime = std::chrono::seconds(kFullBleResetDelaySeconds + 10);
+    for (auto& die : dice_)
+    {
+        die->suspendReconnectUntil(std::chrono::steady_clock::now() + totalSuspendTime);
+    }
+
+    // Force-release every die (connected or not)
+    for (auto& die : dice_)
+    {
+        die->forceReleaseConnection();
+    }
+
+    if (logger_)
+    {
+        logger_("[RESET] Waiting " + std::to_string(kFullBleResetDelaySeconds) +
+                "s for BLE adapter cleanup...");
+    }
+
+    // Wait for BLE adapter to fully clean up
+    std::this_thread::sleep_for(std::chrono::seconds(kFullBleResetDelaySeconds));
+
+    if (logger_)
+    {
+        logger_("[RESET] BLE cleanup done — resuming dice with staggered timing");
+    }
+
+    // Stagger reconnection: resume dice one at a time with 8s gaps.
+    // Simultaneous connection attempts compete for the BLE adapter and both fail.
+    const auto resumeNow = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < dice_.size(); ++i)
+    {
+        auto delay = std::chrono::seconds(i * 8);
+        dice_[i]->suspendReconnectUntil(resumeNow + delay);
+        if (logger_)
+        {
+            logger_("[RESET] " + dice_[i]->label() + " will resume in " +
+                    std::to_string(i * 8) + "s");
+        }
+    }
+
+    lastFullBleReset_ = std::chrono::steady_clock::now();
 }
 
 bool DiceManager::allDiceSelected() const
