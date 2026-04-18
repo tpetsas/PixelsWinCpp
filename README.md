@@ -1,25 +1,37 @@
-# C++ Pixels Dice Library For Windows
+# PixelsCpp — C++ Library & App for Pixels Dice
 
-This is the C++ Pixels library for Windows.
-Windows Runtime [WinRT](https://github.com/microsoft/cppwinrt) APIs are used
-to access Bluetooth.
+A C++ library and companion app for [Pixels](https://gamewithpixels.com/) dice on Windows,
+using [WinRT](https://github.com/microsoft/cppwinrt) APIs for Bluetooth Low Energy communication.
 
-Windows 10 version 1709 (Fall Creators Update) or more recent is required.
+Windows 10 version 1709 (Fall Creators Update) or later is required.
 
-## Foreword
+## Fork Notice
 
-Pixels are full of LEDs, smarts and no larger than regular dice, they can be
-customized to light up when and how you desire.
-Check our [website](https://gamewithpixels.com/) for more information.
+This project was originally forked from
+[GameWithPixels/PixelsWinCpp](https://github.com/GameWithPixels/PixelsWinCpp).
+After some attempts to contribute improvements upstream via pull requests with no
+response, I decided to make this repository fully independent and maintain it on my own.
 
-> **Warning**
-> Before jumping into programming please make sure to read our Pixels developer's
-> [guide](https://github.com/GameWithPixels/.github/blob/main/doc/DevelopersGuide.md).
+This repo is **no longer tracking upstream** and may diverge significantly from the
+original project.
 
-Please open a [ticket](https://github.com/GameWithPixels/PixelsWinCpp/issues)
-on GitHub if you're having any issue.
+## What's Changed
 
-## Overview
+Since forking, this project has been substantially reworked:
+
+- **CMake build system** — replaced the Visual Studio solution with a portable CMake build.
+- **System tray app** — added a Windows tray application with a status window showing
+  live die state, recent rolls, battery, and RSSI.
+- **Structured multi-die runtime** — refactored into a shared runtime layer
+  (`DiceManager`, `DieConnection`, `ConfigManager`) that supports both the CLI and tray app.
+- **BLE connection stability** — disabled WinRT `MaintainConnection` (which silently
+  loses GATT subscriptions), added event-driven disconnect detection with immediate
+  reconnect, watchdog-based backoff, reconstructive reconnect, recovery scanning, and
+  full BLE adapter reset as a last resort.
+- **Missed roll detection** — detects rolls that occur during a disconnect via
+  advertisement monitoring (debounced) and post-reconnect face comparison.
+- **Serialized BLE operations** — per-die mutexes prevent race conditions in concurrent
+  BLE calls.
 
 This project includes:
 
