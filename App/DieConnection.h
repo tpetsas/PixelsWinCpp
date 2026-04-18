@@ -126,9 +126,11 @@ private:
     int faceBeforeDisconnect_ = 0;  // Saved on disconnect, used to detect missed rolls after reconnect
     Systemic::Pixels::PixelRollState rollStateBeforeDisconnect_ = Systemic::Pixels::PixelRollState::Unknown;  // Saved on disconnect
 
-    // Advert recovery debounce: when die was rolling at disconnect, require consecutive settled adverts
+    // Advert recovery debounce: when die was rolling at disconnect (or rolling adverts observed),
+    // require consecutive settled adverts before reporting a roll result
     int advertSettledFace_ = 0;
     int advertSettledCount_ = 0;
+    bool advertSawRolling_ = false;  // True if rolling adverts were seen during this disconnect
     static constexpr int kAdvertSettledThreshold = 3;  // ~300-600ms at BLE advert intervals
 
     bool hasLastRoll_ = false;
