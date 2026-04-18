@@ -629,6 +629,10 @@ void DieConnection::onPixelDisconnected()
         rollStateBeforeDisconnect_ = pixel_->rollState();
     }
 
+    // Reset advert recovery debounce
+    advertSettledFace_ = 0;
+    advertSettledCount_ = 0;
+
     log("[event] Disconnect detected — requesting immediate reconnect (face=" +
         std::to_string(faceBeforeDisconnect_) + ", rollState=" +
         std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) + ")");
@@ -681,6 +685,117 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
             " to " + std::to_string(newFace) + " during disconnect (rollState=" +
             std::to_string(static_cast<int>(currentRollState)) + ")");
         markRollResult(newFace);
+    }
+}
+
+void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixel>& scannedPixel)
+{
+    if (!scannedPixel)
+    {
+        return;
+    }
+
+    const uint32_t id = static_cast<uint32_t>(scannedPixel->pixelId());
+    if (id != targetPixelId_)
+    {
+        return;
+    }
+
+    int reportFace = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // Only process while disconnected and waiting for reconnect
+        if (connectionState_ != ConnectionState::Selected &&
+            connectionState_ != ConnectionState::Reconnecting)
+        {
+            return;
+        }
+
+        // Already recovered the roll via advert (or no disconnect state saved)
+        if (faceBeforeDisconnect_ == 0)
+        {
+            return;
+        }
+
+        const int advFace = scannedPixel->currentFace();
+        const auto advRollState = scannedPixel->rollState();
+
+        // Debug: log every advertisement received while waiting for recovery
+        log("[advert-debug] face=" + std::to_string(advFace) +
+            ", rollState=" + std::to_string(static_cast<int>(advRollState)) +
+            ", settledFace=" + std::to_string(advertSettledFace_) +
+            ", settledCount=" + std::to_string(advertSettledCount_));
+
+        // Die still rolling — not settled yet, reset debounce and keep listening
+        if (advRollState == PixelRollState::Rolling ||
+            advRollState == PixelRollState::Handling)
+        {
+            advertSettledFace_ = 0;
+            advertSettledCount_ = 0;
+            log("[advert-debug] Still rolling, reset debounce");
+            return;
+        }
+
+        // Die is settled (OnFace or Crooked). Check if this is a missed roll.
+        const bool wasRolling = (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                                 rollStateBeforeDisconnect_ == PixelRollState::Handling);
+
+        if (wasRolling)
+        {
+            // Debounce: require consecutive settled adverts on the same face
+            // to avoid false positives from transient settle readings mid-tumble
+            if (advFace == advertSettledFace_)
+            {
+                advertSettledCount_++;
+                log("[advert-debug] Same face, count now " + std::to_string(advertSettledCount_));
+            }
+            else
+            {
+                advertSettledFace_ = advFace;
+                advertSettledCount_ = 1;
+                log("[advert-debug] Face changed to " + std::to_string(advFace) + ", reset count to 1");
+            }
+
+            if (advertSettledCount_ < kAdvertSettledThreshold)
+            {
+                log("[advert-debug] Waiting for " + std::to_string(kAdvertSettledThreshold) + " consecutive, have " + std::to_string(advertSettledCount_));
+                return;
+            }
+
+            log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
+                std::to_string(advFace) + " (was face=" +
+                std::to_string(faceBeforeDisconnect_) + ", rollState=" +
+                std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
+                ", settled count=" + std::to_string(advertSettledCount_) + ")");
+
+            // Keep monitoring: set to recovered face so further changes are detected
+            faceBeforeDisconnect_ = advFace;
+            rollStateBeforeDisconnect_ = advRollState;
+            advertSettledFace_ = 0;
+            advertSettledCount_ = 0;
+            reportFace = advFace;
+        }
+        else if (advFace != faceBeforeDisconnect_)
+        {
+            // Die was at rest before disconnect but face changed — report immediately
+            log("[advert-recovery] Roll detected via advertisement: face=" +
+                std::to_string(advFace) + " (was face=" +
+                std::to_string(faceBeforeDisconnect_) + ", rollState=" +
+                std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) + ")");
+
+            // Keep monitoring: set to recovered face so further changes are detected
+            faceBeforeDisconnect_ = advFace;
+            rollStateBeforeDisconnect_ = advRollState;
+            reportFace = advFace;
+        }
+    }
+
+    // markRollResult acquires mutex_ internally, must call outside the lock
+    if (reportFace > 0)
+    {
+        markRollResult(reportFace);
     }
 }
 

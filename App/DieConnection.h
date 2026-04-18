@@ -56,6 +56,9 @@ public:
     std::chrono::steady_clock::time_point lastSuccessfulConnect() const;
     DieStatusSnapshot snapshot() const;
 
+    // Advertisement-based missed roll recovery
+    void processAdvertisement(const std::shared_ptr<const Systemic::Pixels::ScannedPixel>& scannedPixel);
+
     // Adapter contention management
     void forceReleaseConnection();
     void requestPriorityReconnect();
@@ -122,6 +125,12 @@ private:
     // Roll tracking
     int faceBeforeDisconnect_ = 0;  // Saved on disconnect, used to detect missed rolls after reconnect
     Systemic::Pixels::PixelRollState rollStateBeforeDisconnect_ = Systemic::Pixels::PixelRollState::Unknown;  // Saved on disconnect
+
+    // Advert recovery debounce: when die was rolling at disconnect, require consecutive settled adverts
+    int advertSettledFace_ = 0;
+    int advertSettledCount_ = 0;
+    static constexpr int kAdvertSettledThreshold = 3;  // ~300-600ms at BLE advert intervals
+
     bool hasLastRoll_ = false;
     int lastRollFace_ = 0;
     std::chrono::system_clock::time_point lastRollAt_{};
