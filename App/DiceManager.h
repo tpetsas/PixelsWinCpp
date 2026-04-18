@@ -42,10 +42,12 @@ public:
 private:
     void startScanner();
     void stopScanner();
+    void checkDisconnectedDieScan();
     void checkRecoveryScan();
     void checkAdapterContention();
     void checkFullBleReset();
     bool allDiceSelected() const;
+    bool anyDieDisconnected() const;
     std::string configuredDiceText() const;
 
     Logger logger_;

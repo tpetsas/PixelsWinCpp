@@ -60,6 +60,7 @@ void DiceManager::start()
                 }
             }
 
+            checkDisconnectedDieScan();
             checkRecoveryScan();
             // Contention disabled — releasing a healthy die when the adapter is
             // poisoned just makes both dice stuck.  Full BLE reset is the
@@ -241,11 +242,15 @@ void DiceManager::startScanner()
             {
                 selectedAny = true;
             }
+
+            // Feed advertisement data to disconnected dice for fast roll recovery
+            die->processAdvertisement(scannedPixel);
         }
 
         // Do not stop scanner directly from its callback thread.
         // Request stop and let runUntilEnterPressed() stop it safely.
-        if (selectedAny && allDiceSelected())
+        // But keep scanner running if any die is disconnected (for advert-based roll recovery).
+        if (selectedAny && allDiceSelected() && !anyDieDisconnected())
         {
             stopScanRequested_ = true;
         }
@@ -521,6 +526,55 @@ bool DiceManager::allDiceSelected() const
         }
     }
     return true;
+}
+
+bool DiceManager::anyDieDisconnected() const
+{
+    for (const auto& die : dice_)
+    {
+        const auto state = die->connectionState();
+        if (state == ConnectionState::Selected || state == ConnectionState::Reconnecting)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DiceManager::checkDisconnectedDieScan()
+{
+    const bool disconnected = anyDieDisconnected();
+
+    // If scanner is running (not as a recovery scan) and all dice are back, stop it
+    if (isScanning() && !recoveryScanActive_ && !disconnected && allDiceSelected())
+    {
+        if (logger_)
+        {
+            logger_("\n[advert-scan] All dice reconnected, stopping advertisement scanner.");
+        }
+        stopScanner();
+        return;
+    }
+
+    // If scanner is already running or recovery scan is active, nothing to do
+    if (isScanning() || recoveryScanActive_)
+    {
+        return;
+    }
+
+    // Start scanner if any die is disconnected so we can receive advertisements
+    // for fast missed-roll recovery, regardless of failure count
+    if (!disconnected)
+    {
+        return;
+    }
+
+    if (logger_)
+    {
+        logger_("\n[advert-scan] Starting scanner for disconnected die advertisement recovery...");
+    }
+
+    startScanner();
 }
 
 std::string DiceManager::configuredDiceText() const
