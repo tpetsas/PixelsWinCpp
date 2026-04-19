@@ -77,7 +77,7 @@ private:
     void startConnectThread();
     void markAnyMessage();
     void markRollEvent();
-    void markRollResult(int face);
+    void markRollResult(int face, bool isMissedRoll = false);
     void notifyStateChanged() const;
     void setConnectionState(ConnectionState newState);
 

@@ -676,7 +676,7 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
             ", rollState=" + std::to_string(static_cast<int>(savedRollState)) +
             ") -> landed on " + std::to_string(newFace) +
             " (rollState=" + std::to_string(static_cast<int>(currentRollState)) + ")");
-        markRollResult(newFace);
+        markRollResult(newFace, /*isMissedRoll=*/true);
         return;
     }
 
@@ -690,7 +690,7 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
         log("[missed-roll] Face changed from " + std::to_string(savedFace) +
             " to " + std::to_string(newFace) + " during disconnect (rollState=" +
             std::to_string(static_cast<int>(currentRollState)) + ")");
-        markRollResult(newFace);
+        markRollResult(newFace, /*isMissedRoll=*/true);
     }
 }
 
@@ -837,7 +837,7 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
     // markRollResult acquires mutex_ internally, must call outside the lock
     if (reportFace > 0)
     {
-        markRollResult(reportFace);
+        markRollResult(reportFace, /*isMissedRoll=*/true);
     }
 }
 
@@ -1162,7 +1162,7 @@ void DieConnection::markRollEvent()
     lastAnyMessage_ = lastRollEvent_;
 }
 
-void DieConnection::markRollResult(int face)
+void DieConnection::markRollResult(int face, bool isMissedRoll)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1176,7 +1176,9 @@ void DieConnection::markRollResult(int face)
         }
     }
     notifyStateChanged();
-    if (rollObserver_)
+    // Only notify the roll server for real physical rolls, not missed-roll
+    // recovery after reconnect (those are face-change artifacts, not real rolls)
+    if (rollObserver_ && !isMissedRoll)
     {
         rollObserver_(label_, face);
     }
