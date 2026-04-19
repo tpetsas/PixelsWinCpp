@@ -15,6 +15,7 @@
 #include <shellapi.h>
 
 #include "App/Runtime/PixelsRuntimeService.h"
+#include "App/Server/RollServer.h"
 #include "App/Tray/TraySettings.h"
 
 namespace Systemic::Pixels
@@ -92,6 +93,7 @@ private:
     std::atomic<bool> stateDirty_ = true;
 
     std::unique_ptr<PixelsRuntimeService> runtime_;
+    std::unique_ptr<RollServer> rollServer_;
 
     struct SetupDiscoveredDie
     {

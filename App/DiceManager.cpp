@@ -12,14 +12,16 @@
 using namespace Systemic::Pixels;
 using namespace std::chrono_literals;
 
-DiceManager::DiceManager(const std::vector<uint32_t>& targetPixelIds, Logger logger, StateObserver stateObserver)
+DiceManager::DiceManager(const std::vector<uint32_t>& targetPixelIds, Logger logger,
+                         StateObserver stateObserver, RollObserver rollObserver)
     : logger_(std::move(logger)),
-      stateObserver_(std::move(stateObserver))
+      stateObserver_(std::move(stateObserver)),
+      rollObserver_(std::move(rollObserver))
 {
     for (size_t i = 0; i < targetPixelIds.size(); ++i)
     {
         const std::string label = "die " + std::to_string(i + 1);
-        dice_.emplace_back(std::make_unique<DieConnection>(targetPixelIds[i], label, logger_, stateObserver_));
+        dice_.emplace_back(std::make_unique<DieConnection>(targetPixelIds[i], label, logger_, stateObserver_, rollObserver_));
     }
 }
 

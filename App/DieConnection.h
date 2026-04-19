@@ -32,8 +32,10 @@ class DieConnection
 public:
     using Logger = std::function<void(const std::string&)>;
     using StateObserver = std::function<void()>;
+    using RollObserver = std::function<void(const std::string& label, int face)>;
 
-    DieConnection(uint32_t targetPixelId, std::string label, Logger logger, StateObserver stateObserver = nullptr);
+    DieConnection(uint32_t targetPixelId, std::string label, Logger logger,
+                  StateObserver stateObserver = nullptr, RollObserver rollObserver = nullptr);
     ~DieConnection();
 
     DieConnection(const DieConnection&) = delete;
@@ -91,6 +93,7 @@ private:
     const std::string label_;
     const Logger logger_;
     const StateObserver stateObserver_;
+    const RollObserver rollObserver_;
 
     std::shared_ptr<Systemic::Pixels::Pixel> pixel_;
     std::shared_ptr<Delegate> delegate_;

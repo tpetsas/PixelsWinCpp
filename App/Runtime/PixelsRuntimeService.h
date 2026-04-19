@@ -15,8 +15,10 @@ class PixelsRuntimeService
 public:
     using Logger = std::function<void(const std::string&)>;
     using StateObserver = std::function<void()>;
+    using RollObserver = std::function<void(const std::string& label, int face)>;
 
-    explicit PixelsRuntimeService(Logger logger = nullptr, StateObserver stateObserver = nullptr);
+    explicit PixelsRuntimeService(Logger logger = nullptr, StateObserver stateObserver = nullptr,
+                                  RollObserver rollObserver = nullptr);
     ~PixelsRuntimeService();
 
     PixelsRuntimeService(const PixelsRuntimeService&) = delete;
@@ -35,6 +37,7 @@ public:
 private:
     Logger logger_;
     StateObserver stateObserver_;
+    RollObserver rollObserver_;
 
     PixelsConfig config_;
     std::unique_ptr<DiceManager> manager_;

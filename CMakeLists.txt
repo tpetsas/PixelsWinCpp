@@ -157,6 +157,7 @@ add_executable(PixelsTray WIN32
     App/Runtime/PixelsRuntimeService.cpp
     App/Tray/TrayApp.cpp
     App/Tray/TraySettings.cpp
+    App/Server/RollServer.cpp
     App/CliOptions.h
     App/ConfigManager.h
     App/DieConnection.h
@@ -165,6 +166,7 @@ add_executable(PixelsTray WIN32
     App/Runtime/PixelsRuntimeService.h
     App/Tray/TrayApp.h
     App/Tray/TraySettings.h
+    App/Server/RollServer.h
 )
 
 target_link_libraries(PixelsTray PRIVATE PixelsLib shell32 comdlg32)
@@ -194,4 +196,27 @@ set_target_properties(PixelsTray PROPERTIES
 
 install(TARGETS PixelsTray
     RUNTIME DESTINATION bin
+)
+
+# Test client for the RollServer named pipe
+add_executable(RollTestClient
+    test_client_main.cpp
+)
+
+target_compile_definitions(RollTestClient PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    UNICODE
+    _UNICODE
+)
+
+if(MSVC)
+    target_compile_options(RollTestClient PRIVATE
+        /permissive-
+        /W4
+    )
+endif()
+
+set_target_properties(RollTestClient PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )

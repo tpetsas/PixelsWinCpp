@@ -133,11 +133,13 @@ private:
     DieConnection* owner_;
 };
 
-DieConnection::DieConnection(uint32_t targetPixelId, std::string label, Logger logger, StateObserver stateObserver)
+DieConnection::DieConnection(uint32_t targetPixelId, std::string label, Logger logger,
+                             StateObserver stateObserver, RollObserver rollObserver)
     : targetPixelId_(targetPixelId),
       label_(std::move(label)),
       logger_(std::move(logger)),
       stateObserver_(std::move(stateObserver)),
+      rollObserver_(std::move(rollObserver)),
       delegate_(std::make_shared<Delegate>(this))
 {
 }
@@ -1174,6 +1176,10 @@ void DieConnection::markRollResult(int face)
         }
     }
     notifyStateChanged();
+    if (rollObserver_)
+    {
+        rollObserver_(label_, face);
+    }
 }
 
 void DieConnection::notifyStateChanged() const
