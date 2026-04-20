@@ -670,13 +670,15 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
     // Case 1: Die was mid-roll at disconnect time. Any settled face after
     // reconnect is the result of that roll, even if it coincidentally matches
     // the transient face we last saw while tumbling.
+    // This is a genuine physical roll — notify the roll observer so the
+    // RollServer can use it (e.g. when the user rolled during a disconnect).
     if (wasRolling && isAtRest)
     {
         log("[missed-roll] Die was rolling at disconnect (face=" + std::to_string(savedFace) +
             ", rollState=" + std::to_string(static_cast<int>(savedRollState)) +
             ") -> landed on " + std::to_string(newFace) +
             " (rollState=" + std::to_string(static_cast<int>(currentRollState)) + ")");
-        markRollResult(newFace, /*isMissedRoll=*/true);
+        markRollResult(newFace, /*isMissedRoll=*/false);
         return;
     }
 
@@ -708,6 +710,7 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
     }
 
     int reportFace = 0;
+    bool reportWasRolling = false;  // Track if roll came from a genuinely rolling die
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -785,6 +788,7 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
             advertSettledCount_ = 0;
             advertSawRolling_ = false;
             reportFace = advFace;
+            reportWasRolling = true;
         }
         else if (advFace != faceBeforeDisconnect_)
         {
@@ -835,9 +839,12 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
     }
 
     // markRollResult acquires mutex_ internally, must call outside the lock
+    // If the die was genuinely rolling, this is a real roll (isMissedRoll=false)
+    // so the RollServer gets notified. If it was at rest and face changed,
+    // it's ambiguous (isMissedRoll=true) — record but don't trigger the server.
     if (reportFace > 0)
     {
-        markRollResult(reportFace, /*isMissedRoll=*/true);
+        markRollResult(reportFace, /*isMissedRoll=*/!reportWasRolling);
     }
 }
 
