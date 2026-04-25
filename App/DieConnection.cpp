@@ -200,8 +200,10 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
         }
 
         // Recovery re-discovery: die was already selected but disconnected with many failures.
-        // Request immediate reconnect with the fresh ScannedPixel data.
-        if (connectionState_ == ConnectionState::Selected && pixel_ && consecutiveFailures_ >= 2)
+        // Request immediate reconnect with the fresh ScannedPixel data, but only outside
+        // a suspend window — firing during suspension defeats the advert fast-path.
+        if (connectionState_ == ConnectionState::Selected && pixel_ && consecutiveFailures_ >= 2 &&
+            std::chrono::steady_clock::now() >= reconnectSuspendedUntil_)
         {
             recoveryRediscovery = true;
             immediateReconnectRequested_.store(true);
@@ -494,6 +496,11 @@ void DieConnection::forceReleaseConnection()
                 faceBeforeDisconnect_ = localPixel->currentFace();
                 rollStateBeforeDisconnect_ = localPixel->rollState();
             }
+            // Reset advert debounce so stale counts from a previous disconnect
+            // don't contaminate the next one (bug B3 guard)
+            advertSettledFace_ = 0;
+            advertSettledCount_ = 0;
+            advertSawRolling_ = false;
             setConnectionState(ConnectionState::Selected);
             // Give this die a small backoff so the failing die gets priority
             lastConnectAttempt_ = std::chrono::steady_clock::now();
@@ -778,49 +785,81 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
 
         if (wasRolling)
         {
-            // Debounce: require consecutive settled adverts on the same face
-            // to avoid false positives from transient settle readings mid-tumble
-            if (advFace == advertSettledFace_)
+            // Fast path: GATT confirmed the die was rolling at disconnect, and the
+            // advert now shows it settled on a DIFFERENT face in a non-ambiguous state.
+            // This combination is unambiguous — no pre-roll stale advert can match it.
+            // Accept on a single packet; skip the 2-packet debounce.
+            // Exclude Crooked(4): that state means the die is not properly settled.
+            // rollState values beyond the enum (e.g. firmware state 5) are treated as
+            // settled and accepted here.
+            const bool unambiguousSettle =
+                (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                 rollStateBeforeDisconnect_ == PixelRollState::Handling) &&
+                advRollState != PixelRollState::Crooked &&
+                advFace != faceBeforeDisconnect_;
+
+            if (unambiguousSettle)
             {
-                advertSettledCount_++;
-                log("[advert-debug] Same face, count now " + std::to_string(advertSettledCount_));
+                log("[advert-recovery] Fast-path settle: rolling->settled face=" +
+                    std::to_string(advFace) + " (was face=" +
+                    std::to_string(faceBeforeDisconnect_) + ", advRollState=" +
+                    std::to_string(static_cast<int>(advRollState)) + ")");
+                faceBeforeDisconnect_ = advFace;
+                rollStateBeforeDisconnect_ = advRollState;
+                advertSettledFace_ = 0;
+                advertSettledCount_ = 0;
+                advertSawRolling_ = false;
+                reportFace = advFace;
+                reportWasRolling = true;
             }
             else
             {
-                advertSettledFace_ = advFace;
-                advertSettledCount_ = 1;
-                log("[advert-debug] Face changed to " + std::to_string(advFace) + ", reset count to 1");
+                // Slow path: require consecutive settled adverts on the same face.
+                // Used when: face matches tumble face (ambiguous), Crooked state,
+                // or only advertSawRolling_ is set (die was at rest at disconnect).
+                if (advFace == advertSettledFace_)
+                {
+                    advertSettledCount_++;
+                    log("[advert-debug] Same face, count now " + std::to_string(advertSettledCount_));
+                }
+                else
+                {
+                    advertSettledFace_ = advFace;
+                    advertSettledCount_ = 1;
+                    log("[advert-debug] Face changed to " + std::to_string(advFace) + ", reset count to 1");
+                }
+
+                if (advertSettledCount_ < kAdvertSettledThreshold)
+                {
+                    log("[advert-debug] Waiting for " + std::to_string(kAdvertSettledThreshold) + " consecutive, have " + std::to_string(advertSettledCount_));
+                    return;
+                }
+
+                log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
+                    std::to_string(advFace) + " (was face=" +
+                    std::to_string(faceBeforeDisconnect_) + ", rollState=" +
+                    std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
+                    ", settled count=" + std::to_string(advertSettledCount_) + ")");
+
+                faceBeforeDisconnect_ = advFace;
+                rollStateBeforeDisconnect_ = advRollState;
+                advertSettledFace_ = 0;
+                advertSettledCount_ = 0;
+                advertSawRolling_ = false;
+                reportFace = advFace;
+                reportWasRolling = true;
             }
-
-            if (advertSettledCount_ < kAdvertSettledThreshold)
-            {
-                log("[advert-debug] Waiting for " + std::to_string(kAdvertSettledThreshold) + " consecutive, have " + std::to_string(advertSettledCount_));
-                return;
-            }
-
-            log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
-                std::to_string(advFace) + " (was face=" +
-                std::to_string(faceBeforeDisconnect_) + ", rollState=" +
-                std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
-                ", settled count=" + std::to_string(advertSettledCount_) + ")");
-
-            // Keep monitoring: set to recovered face so further changes are detected
-            faceBeforeDisconnect_ = advFace;
-            rollStateBeforeDisconnect_ = advRollState;
-            advertSettledFace_ = 0;
-            advertSettledCount_ = 0;
-            advertSawRolling_ = false;
-            reportFace = advFace;
-            reportWasRolling = true;
         }
         else if (advFace != faceBeforeDisconnect_)
         {
-            // Face changed while die was at rest. Only consider OnFace/Crooked as
-            // potential rolls — rollState=None(5) means just moved/handled.
-            // Apply debouncing here too: advertisement data can show stale rollState
-            // values, so a single advert should never trigger a roll report.
-            if (advRollState == PixelRollState::OnFace ||
-                advRollState == PixelRollState::Crooked)
+            // Face changed while die was at rest. Accept any non-rolling state —
+            // this includes rollState=5 (firmware idle, not in C++ SDK enum) which
+            // is the normal post-roll settled state reported by current Pixel firmware.
+            const bool isSettledState =
+                (advRollState != PixelRollState::Rolling &&
+                 advRollState != PixelRollState::Handling);
+
+            if (isSettledState)
             {
                 if (advFace == advertSettledFace_)
                 {
@@ -851,13 +890,13 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
                 advertSettledFace_ = 0;
                 advertSettledCount_ = 0;
                 reportFace = advFace;
-                reportWasRolling = true;  // 3-consecutive settled adverts on a new face is a real roll
+                reportWasRolling = true;
             }
             else
             {
                 log("[advert-debug] Face changed to " + std::to_string(advFace) +
                     " (rollState=" + std::to_string(static_cast<int>(advRollState)) +
-                    ") — not a roll, tracking only");
+                    ") — still in motion, tracking only");
             }
         }
     }
@@ -898,6 +937,7 @@ bool DieConnection::reconnectPixel()
     static constexpr int kRetryDelaySeconds = 2;
 
     bool ok = false;
+    bool suspendedBySuspend = false;
     for (int attempt = 0; attempt < kReconnectRetries && !ok; ++attempt)
     {
         if (attempt == 0)
@@ -915,6 +955,14 @@ bool DieConnection::reconnectPixel()
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (shuttingDown_) return false;
+            // Honor suspend window mid-retry: RollServer may have issued a suspend
+            // after we started this loop. Abort so the scanner gets a clear channel.
+            if (std::chrono::steady_clock::now() < reconnectSuspendedUntil_)
+            {
+                log("[reconnect] Suspended mid-retry, aborting reconnect loop");
+                suspendedBySuspend = true;
+                break;
+            }
         }
 
         try
@@ -956,7 +1004,16 @@ bool DieConnection::reconnectPixel()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            if (suspendedBySuspend)
+            {
+                // Voluntary abort: decay failure count so the die stays in the lighter
+                // reconnectPixel path rather than escalating to reconstructiveReconnect
+                consecutiveFailures_ = std::max(0, consecutiveFailures_ - 1);
+            }
+            else
+            {
+                consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            }
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
@@ -1012,27 +1069,48 @@ bool DieConnection::reconstructiveReconnect()
     // Also allow the advertisement scanner to receive adverts from this die
     // for missed-roll recovery (the die can only advertise when no connection
     // attempt is active).
-    log("[reconstructive] Waiting 3s for BLE cleanup + advertisement scan window...");
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-
+    log("[reconstructive] Waiting up to 3s for BLE cleanup + advertisement scan window...");
+    bool suspendedBySuspend = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (shuttingDown_) return false;
-        // Re-read ScannedPixel — scanner may have received fresh data during the wait
-        if (lastScannedPixel_)
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline)
         {
-            scannedPixel = lastScannedPixel_;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (shuttingDown_) return false;
+                if (std::chrono::steady_clock::now() < reconnectSuspendedUntil_)
+                {
+                    log("[reconstructive] Suspend detected during cleanup wait, aborting");
+                    suspendedBySuspend = true;
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
     }
 
-    // Create new Pixel from stored ScannedPixel data
-    auto newPixel = Pixel::create(*scannedPixel, delegate_);
-
+    std::shared_ptr<Pixel> newPixel;
+    if (!suspendedBySuspend)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pixel_ = newPixel;
-        lastAnyMessage_ = std::chrono::steady_clock::now();
-        lastRollEvent_ = lastAnyMessage_;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (shuttingDown_) return false;
+            // Re-read ScannedPixel — scanner may have received fresh data during the wait
+            if (lastScannedPixel_)
+            {
+                scannedPixel = lastScannedPixel_;
+            }
+        }
+
+        // Create new Pixel from stored ScannedPixel data
+        newPixel = Pixel::create(*scannedPixel, delegate_);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pixel_ = newPixel;
+            lastAnyMessage_ = std::chrono::steady_clock::now();
+            lastRollEvent_ = lastAnyMessage_;
+        }
     }
 
     // Retry loop: try up to 3 times with 2s delays, same as reconnectPixel.
@@ -1040,7 +1118,7 @@ bool DieConnection::reconstructiveReconnect()
     static constexpr int kReconstructiveRetryDelaySeconds = 2;
 
     bool ok = false;
-    for (int attempt = 0; attempt < kReconstructiveRetries && !ok; ++attempt)
+    for (int attempt = 0; attempt < kReconstructiveRetries && !ok && !suspendedBySuspend; ++attempt)
     {
         if (attempt > 0)
         {
@@ -1053,6 +1131,13 @@ bool DieConnection::reconstructiveReconnect()
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (shuttingDown_) return false;
+            // Honor suspend window mid-retry (see reconnectPixel for rationale)
+            if (std::chrono::steady_clock::now() < reconnectSuspendedUntil_)
+            {
+                log("[reconstructive] Suspended mid-retry, aborting reconnect loop");
+                suspendedBySuspend = true;
+                break;
+            }
         }
 
         try
@@ -1098,7 +1183,16 @@ bool DieConnection::reconstructiveReconnect()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            if (suspendedBySuspend)
+            {
+                // Voluntary abort: decay failure count so the die stays in the lighter
+                // reconnectPixel path rather than escalating further
+                consecutiveFailures_ = std::max(0, consecutiveFailures_ - 1);
+            }
+            else
+            {
+                consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            }
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;

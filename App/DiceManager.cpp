@@ -233,11 +233,7 @@ void DiceManager::suspendReconnects(std::chrono::seconds duration)
     const auto until = std::chrono::steady_clock::now() + duration;
     for (auto& die : dice_)
     {
-        const auto snap = die->snapshot();
-        if (snap.status != Systemic::Pixels::PixelStatus::Ready)
-        {
-            die->suspendReconnectUntil(until);
-        }
+        die->suspendReconnectUntil(until);
     }
 }
 

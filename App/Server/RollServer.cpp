@@ -427,22 +427,35 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
     // not when one of two configured dice is temporarily disconnected.
     bool needsPopup = (rollsNeeded == 2 && configuredDice <= 1);
 
-    // When no dice are currently connected, a 60s GATT wait is pointless.
-    // 20s is enough for the advertisement path to fire or a missed-roll reconnect to complete.
-    const auto kFirstRollTimeout = (connectedDice == 0)
-        ? std::chrono::seconds(20) : std::chrono::seconds(60);
-    // With reconnects suspended (see below), the advert path fires in ~1-2s.
-    // 10s is a generous safety margin.
-    static constexpr auto kSecondRollTimeout = std::chrono::seconds(10);
+    // 25s gives the user ample time to roll while capping the worst-case failure
+    // (both GATT and advert paths dead) at a tolerable delay. The advert fast-path
+    // fires in <1s when a die disconnects mid-roll, so the 25s only burns in a
+    // complete radio blackout — far better than the old 60s.
+    static constexpr auto kFirstRollTimeout = std::chrono::seconds(25);
+    // Windows BLE takes ~10-12s to start delivering advertisements from a freshly-
+    // disconnected device (radio/stack arbitration delay). The advert path fires
+    // reliably once adverts flow, but needs this window to survive the delay.
+    // 15s provides ~3-5s of headroom past the typical 10-12s Windows advert delay.
+    static constexpr auto kSecondRollTimeout = std::chrono::seconds(15);
 
-    // For multi-die requests with any disconnected die: suspend watchdog reconnect
-    // attempts immediately so the BLE scanner has a clear channel to receive
-    // advertisements. A disconnected die advertises every ~300ms; with reconnects
-    // paused, 2 consecutive settled adverts arrive in under 1s.
-    if (rollsNeeded > 1 && connectedDice < rollsNeeded && reconnectSuspender_)
+    // Suspend watchdog reconnect attempts so the BLE scanner has a clear channel
+    // for advert-based roll recovery during this request window.
+    // For 2-die requests, pre-arm for the full first-roll timeout so that a Ready
+    // die which disconnects mid-request is also covered (Fix A.1+A.2: the watchdog
+    // checks reconnectSuspendedUntil_ before firing, so even a die that just
+    // disconnected won't start reconnecting during the request window).
+    if (reconnectSuspender_)
     {
-        log("[RollServer] Suspending reconnects for disconnected dice (10s) to unblock advert path");
-        reconnectSuspender_(std::chrono::seconds(10));
+        if (rollsNeeded == 2)
+        {
+            log("[RollServer] Pre-arming reconnect suspension for 2-die request (25s)");
+            reconnectSuspender_(kFirstRollTimeout);
+        }
+        else if (connectedDice < configuredDice)
+        {
+            log("[RollServer] Suspending reconnects for disconnected dice (10s) to unblock advert path");
+            reconnectSuspender_(std::chrono::seconds(10));
+        }
     }
 
     {
@@ -469,6 +482,18 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
 
         if (rollsNeeded == 2 && pendingRequest_.collectedRolls.size() == 1)
         {
+            // Mid-request: unconditionally refresh suspension after the first roll arrives.
+            // The pre-arm at request start covers most cases; this handles the narrow race
+            // where die 2 disconnects exactly as die 1 fires its roll notification.
+            if (reconnectSuspender_)
+            {
+                lock.unlock();
+                log("[RollServer] Mid-request: refreshing reconnect suspension (" +
+                    std::to_string(kSecondRollTimeout.count()) + "s) for second die");
+                reconnectSuspender_(kSecondRollTimeout);
+                lock.lock();
+            }
+
             if (needsPopup)
             {
                 // Unlock before showing popup (it has a timer)
@@ -477,11 +502,81 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                 lock.lock();
             }
 
-            // Wait for second roll (with shorter timeout — fallback to face snapshot)
-            bool gotSecond = rollCv_.wait_for(lock, kSecondRollTimeout, [this]()
+            // Snapshot pre-roll face for the second die so we can detect a face change
+            // even when the GATT onRolled notification is dropped by Windows.
+            std::string firstLabel = pendingRequest_.collectedLabels.empty()
+                ? "" : pendingRequest_.collectedLabels[0];
+            int otherDiePreFace = 0;
+            std::string otherDieLabel;
+            if (snapshotProvider_)
             {
-                return pendingRequest_.collectedRolls.size() >= 2 || !running_;
-            });
+                lock.unlock();
+                for (const auto& s : snapshotProvider_())
+                {
+                    if (s.label != firstLabel)
+                    {
+                        otherDiePreFace = s.currentFace;
+                        otherDieLabel = s.label;
+                        break;
+                    }
+                }
+                lock.lock();
+            }
+
+            // Wait for second roll. Poll every 500ms so we can detect a face change on a
+            // connected-but-silent die (Windows may drop GATT notifications; currentFace is
+            // still updated by every RollState heartbeat, including rollState=5 frames).
+            const auto secondDeadline = std::chrono::steady_clock::now() + kSecondRollTimeout;
+            bool gotSecond = false;
+            while (running_ && !gotSecond && std::chrono::steady_clock::now() < secondDeadline)
+            {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    secondDeadline - std::chrono::steady_clock::now());
+                const auto slice = std::min(remaining, std::chrono::milliseconds(500));
+
+                gotSecond = rollCv_.wait_for(lock, slice, [this]()
+                {
+                    return pendingRequest_.collectedRolls.size() >= 2 || !running_;
+                });
+
+                if (gotSecond || !running_) break;
+                if (std::chrono::steady_clock::now() >= secondDeadline) break;
+
+                // Snapshot poll: if the other die is still Ready but its face changed,
+                // the notification was dropped — accept the face-change as the roll result.
+                if (!otherDieLabel.empty() && snapshotProvider_ && otherDiePreFace > 0)
+                {
+                    const auto msElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now() - pendingRequest_.startedAt).count();
+                    if (msElapsed >= 1500)
+                    {
+                        lock.unlock();
+                        auto snaps = snapshotProvider_();
+                        lock.lock();
+
+                        if (pendingRequest_.collectedRolls.size() >= 2)
+                        {
+                            gotSecond = true;
+                            break;
+                        }
+                        for (const auto& s : snaps)
+                        {
+                            if (s.label != otherDieLabel) continue;
+                            if (s.status != Systemic::Pixels::PixelStatus::Ready) continue;
+                            if (s.currentFace == 0 || s.currentFace == otherDiePreFace) continue;
+
+                            log("[RollServer] Second-roll snapshot recovery: " + s.label +
+                                " face " + std::to_string(otherDiePreFace) +
+                                " -> " + std::to_string(s.currentFace) +
+                                " (GATT notification likely dropped)");
+                            pendingRequest_.collectedRolls.push_back(s.currentFace);
+                            pendingRequest_.collectedLabels.push_back(s.label + "-snapshot");
+                            gotSecond = true;
+                            break;
+                        }
+                    }
+                }
+            }
 
             if (!running_)
             {
