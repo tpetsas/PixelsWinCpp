@@ -1,13 +1,39 @@
 #include <windows.h>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <sstream>
+#include <map>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
 
 static constexpr const wchar_t* kPipeName = L"\\\\.\\pipe\\PixelsDiceRoll";
 
+// Writes a line to both stdout and the log file.
+static std::ofstream g_logFile;
+
+static void tee(const std::string& msg)
+{
+    std::cout << msg << std::endl;
+    if (g_logFile.is_open())
+        g_logFile << msg << "\n";
+}
+
+static std::string timestamp()
+{
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    return oss.str();
+}
+
 HANDLE connectToPipe()
 {
-    std::cout << "Connecting to pipe..." << std::endl;
+    tee("Connecting to pipe...");
 
     while (true)
     {
@@ -23,28 +49,28 @@ HANDLE connectToPipe()
 
         if (pipe != INVALID_HANDLE_VALUE)
         {
-            std::cout << "Connected!" << std::endl;
+            tee("Connected!");
             return pipe;
         }
 
         DWORD err = GetLastError();
         if (err == ERROR_PIPE_BUSY)
         {
-            std::cout << "Pipe busy, waiting..." << std::endl;
+            tee("Pipe busy, waiting...");
             if (!WaitNamedPipeW(kPipeName, 5000))
             {
-                std::cerr << "Timeout waiting for pipe." << std::endl;
+                tee("Timeout waiting for pipe.");
                 return INVALID_HANDLE_VALUE;
             }
         }
         else if (err == ERROR_FILE_NOT_FOUND)
         {
-            std::cerr << "Pipe not found. Is PixelsTray running?" << std::endl;
+            tee("Pipe not found. Is PixelsTray running?");
             return INVALID_HANDLE_VALUE;
         }
         else
         {
-            std::cerr << "Failed to connect, error: " << err << std::endl;
+            tee("Failed to connect, error: " + std::to_string(err));
             return INVALID_HANDLE_VALUE;
         }
     }
@@ -56,7 +82,7 @@ bool sendRequest(HANDLE pipe, const std::string& json)
     DWORD written = 0;
     if (!WriteFile(pipe, msg.c_str(), static_cast<DWORD>(msg.size()), &written, nullptr))
     {
-        std::cerr << "WriteFile failed, error: " << GetLastError() << std::endl;
+        tee("WriteFile failed, error: " + std::to_string(GetLastError()));
         return false;
     }
     FlushFileBuffers(pipe);
@@ -73,61 +99,71 @@ std::string readResponse(HANDLE pipe)
         DWORD bytesRead = 0;
         BOOL ok = ReadFile(pipe, buf, sizeof(buf) - 1, &bytesRead, nullptr);
         if (!ok || bytesRead == 0)
-        {
             break;
-        }
         buf[bytesRead] = '\0';
         result += buf;
-
         if (result.find('\n') != std::string::npos)
-        {
             break;
-        }
     }
 
-    // Trim trailing newline
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    {
         result.pop_back();
-    }
 
     return result;
 }
 
 void printHelp()
 {
-    std::cout << "\n=== Pixels Roll Server Test Client ===" << std::endl;
-    std::cout << "Commands:" << std::endl;
-    std::cout << "  normal <gen>         - Send normal roll request" << std::endl;
-    std::cout << "  advantage <gen>      - Send advantage roll request" << std::endl;
-    std::cout << "  disadvantage <gen>   - Send disadvantage roll request" << std::endl;
-    std::cout << "  ready                - Send ready command (BG3 click)" << std::endl;
-    std::cout << "  raw <json>           - Send raw JSON string" << std::endl;
-    std::cout << "  help                 - Show this help" << std::endl;
-    std::cout << "  quit                 - Exit" << std::endl;
-    std::cout << std::endl;
+    tee("\n=== Pixels Roll Server Test Client ===");
+    tee("Commands:");
+    tee("  normal               - Send normal roll (auto-increments generation)");
+    tee("  advantage            - Send advantage roll (auto-increments generation)");
+    tee("  disadvantage         - Send disadvantage roll (auto-increments generation)");
+    tee("  normal <gen>         - Send normal roll with specific generation");
+    tee("  advantage <gen>      - Send advantage roll with specific generation");
+    tee("  disadvantage <gen>   - Send disadvantage roll with specific generation");
+    tee("  ready                - Send ready command (BG3 click)");
+    tee("  raw <json>           - Send raw JSON string");
+    tee("  reset                - Reset all generation counters to 1");
+    tee("  help                 - Show this help");
+    tee("  quit                 - Exit");
+    tee("");
 }
 
 int main()
 {
+    g_logFile.open("client_log.txt", std::ios::app);
+    if (g_logFile.is_open())
+    {
+        g_logFile << "\n--- Session started: " << timestamp() << " ---\n";
+        g_logFile.flush();
+    }
+
     HANDLE pipe = connectToPipe();
     if (pipe == INVALID_HANDLE_VALUE)
     {
-        std::cout << "\nPress Enter to exit...";
+        tee("Press Enter to exit...");
         std::cin.get();
         return 1;
     }
 
     printHelp();
 
+    // Per-mode auto-incrementing generation counters
+    std::map<std::string, int> generations = {
+        {"normal", 1}, {"advantage", 1}, {"disadvantage", 1}
+    };
+
     std::string line;
     while (true)
     {
         std::cout << "> ";
+        if (g_logFile.is_open()) g_logFile << "> " << std::flush;
+
         if (!std::getline(std::cin, line))
-        {
             break;
-        }
+
+        if (g_logFile.is_open()) g_logFile << line << "\n";
 
         if (line.empty()) continue;
 
@@ -146,56 +182,86 @@ int main()
             printHelp();
             continue;
         }
+        else if (cmd == "reset")
+        {
+            for (auto& kv : generations) kv.second = 1;
+            tee("Generation counters reset to 1.");
+            continue;
+        }
         else if (cmd == "ready")
         {
             json = "{\"mode\": \"ready\"}";
         }
         else if (cmd == "normal" || cmd == "advantage" || cmd == "disadvantage")
         {
-            int gen = 1;
-            iss >> gen;
+            int gen = 0;
+            if (iss >> gen)
+            {
+                // Explicit generation — also sync the counter
+                generations[cmd] = gen;
+            }
+            else
+            {
+                gen = generations[cmd];
+            }
             json = "{\"mode\": \"" + cmd + "\", \"generation\": " + std::to_string(gen) + "}";
         }
         else if (cmd == "raw")
         {
             json = line.substr(4);
-            // Trim leading whitespace
             auto pos = json.find_first_not_of(" \t");
             if (pos != std::string::npos)
                 json = json.substr(pos);
             else
             {
-                std::cerr << "Usage: raw <json>" << std::endl;
+                tee("Usage: raw <json>");
                 continue;
             }
         }
         else
         {
-            std::cerr << "Unknown command: " << cmd << " (type 'help')" << std::endl;
+            tee("Unknown command: " + cmd + " (type 'help')");
             continue;
         }
 
-        std::cout << "Sending: " << json << std::endl;
+        tee("Sending: " + json);
+
+        auto t0 = std::chrono::steady_clock::now();
 
         if (!sendRequest(pipe, json))
         {
-            std::cerr << "Send failed, pipe may be broken." << std::endl;
+            tee("Send failed, pipe may be broken.");
             break;
         }
 
-        std::cout << "Waiting for response..." << std::endl;
+        tee("Waiting for response...");
         std::string response = readResponse(pipe);
+
+        auto t1 = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
         if (response.empty())
         {
-            std::cerr << "No response (pipe closed?)." << std::endl;
+            tee("No response (pipe closed?).");
             break;
         }
 
-        std::cout << "Response: " << response << std::endl;
+        tee("Response: " + response);
+        tee("Time: " + std::to_string(ms) + " ms");
+
+        // Auto-increment generation for roll commands (not ready/raw)
+        if (cmd == "normal" || cmd == "advantage" || cmd == "disadvantage")
+            generations[cmd]++;
     }
 
     CloseHandle(pipe);
-    std::cout << "Disconnected." << std::endl;
+    tee("Disconnected.");
+
+    if (g_logFile.is_open())
+    {
+        g_logFile << "--- Session ended: " << timestamp() << " ---\n";
+        g_logFile.close();
+    }
+
     return 0;
 }

@@ -1557,7 +1557,10 @@ void TrayApp::writeLogToFile(const std::wstring& message)
         return;
     }
 
-    std::string narrow(message.begin(), message.end());
+    std::string narrow;
+    narrow.reserve(message.size());
+    for (wchar_t c : message)
+        narrow += static_cast<char>(c);
     logFile_ << narrow << std::endl;
 }
 

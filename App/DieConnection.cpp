@@ -412,29 +412,30 @@ void DieConnection::shutdown()
         setConnectionState(ConnectionState::Shutdown);
     }
 
-    // Wait for any in-progress BLE operation to finish before disconnecting
-    std::lock_guard<std::mutex> bleLock(bleOpMutex_);
+    // Try to acquire the BLE op lock with a timeout. A WinRT connect/identify
+    // call can block for many seconds; we don't want shutdown to hang the UI.
+    bool gotLock = bleOpMutex_.try_lock_for(std::chrono::seconds(3));
 
-    std::shared_ptr<Pixel> localPixel;
+    if (gotLock)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        localPixel = pixel_;
-    }
-
-    if (localPixel)
-    {
-        try
+        std::shared_ptr<Pixel> localPixel;
         {
-            localPixel->disconnect();
+            std::lock_guard<std::mutex> lock(mutex_);
+            localPixel = pixel_;
         }
-        catch (...)
+        if (localPixel)
         {
+            try { localPixel->disconnect(); } catch (...) {}
         }
+        bleOpMutex_.unlock();
     }
 
     if (connectThread_.joinable())
     {
-        connectThread_.join();
+        if (gotLock)
+            connectThread_.join();
+        else
+            connectThread_.detach();  // BLE op still in flight; abandon it
     }
 }
 
@@ -464,7 +465,7 @@ std::chrono::steady_clock::time_point DieConnection::lastSuccessfulConnect() con
 
 void DieConnection::forceReleaseConnection()
 {
-    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
     if (!bleLock.owns_lock())
     {
         log("[adapter] BLE operation in progress, cannot release");
@@ -552,6 +553,8 @@ DieStatusSnapshot DieConnection::snapshot() const
     snapshot.lastRollFace = lastRollFace_;
     snapshot.lastRollAt = lastRollAt_;
     snapshot.recentRollFaces = recentRollFaces_;
+    snapshot.advertSettledFace = advertSettledFace_;
+    snapshot.advertSettledCount = advertSettledCount_;
 
     if (pixel_)
     {
@@ -850,7 +853,7 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
 
 bool DieConnection::reconnectPixel()
 {
-    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
     if (!bleLock.owns_lock())
     {
         log("[reconnect] BLE operation already in progress, skipping");
@@ -949,7 +952,7 @@ bool DieConnection::reconnectPixel()
 
 bool DieConnection::reconstructiveReconnect()
 {
-    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
     if (!bleLock.owns_lock())
     {
         log("[reconstructive] BLE operation already in progress, skipping");
@@ -1098,7 +1101,7 @@ void DieConnection::startConnectThread()
 
     connectThread_ = std::thread([this]()
     {
-        std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+        std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
         if (!bleLock.owns_lock())
         {
             log("[connect] BLE operation already in progress, skipping");

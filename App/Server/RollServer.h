@@ -57,6 +57,7 @@ private:
         int rollsNeeded = 0;
         std::vector<int> collectedRolls;
         std::vector<std::string> collectedLabels;  // which die reported each roll
+        std::chrono::system_clock::time_point startedAt{};
     };
 
     std::mutex rollMutex_;

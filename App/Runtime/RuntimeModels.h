@@ -26,4 +26,9 @@ struct DieStatusSnapshot
     int lastRollFace = 0;
     std::chrono::system_clock::time_point lastRollAt{};
     std::vector<int> recentRollFaces;
+
+    // In-progress advertisement debounce state (non-zero only during a disconnect event
+    // where the die was rolling; resets to 0 after each advert-reported result)
+    int advertSettledFace = 0;
+    int advertSettledCount = 0;
 };

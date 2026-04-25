@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App/Server/RollServer.h"
+#include "App/DieConnection.h"
 
 #include <shellapi.h>
 #include <sstream>
@@ -130,9 +131,26 @@ bool GetClientPointOnScreen(HWND hwnd, float normX, float normY, POINT& outPt)
     return true;
 }
 
+// Move cursor using SendInput so it generates raw-input events.
+// BG3 uses raw input to detect mouse activity and switch from
+// controller mode to mouse mode; SetCursorPos alone won't do it.
+void MoveMouseAbsolute(int screenX, int screenY)
+{
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (sw <= 0 || sh <= 0) return;
+
+    INPUT input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = static_cast<LONG>(std::lround(screenX * 65535.0 / (sw - 1)));
+    input.mi.dy = static_cast<LONG>(std::lround(screenY * 65535.0 / (sh - 1)));
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
 void LeftClickScreenPoint(POINT pt)
 {
-    SetCursorPos(pt.x, pt.y);
+    MoveMouseAbsolute(pt.x, pt.y);
 
     INPUT inputs[2] = {};
     inputs[0].type = INPUT_MOUSE;
@@ -388,6 +406,7 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
         pendingRequest_.rollsNeeded = rollsNeeded;
         pendingRequest_.collectedRolls.clear();
         pendingRequest_.collectedLabels.clear();
+        pendingRequest_.startedAt = std::chrono::system_clock::now();
     }
 
     log("[RollServer] Waiting for " + std::to_string(rollsNeeded) + " roll(s), mode=" +
@@ -455,6 +474,7 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
 
                 std::string reportedLabel = pendingRequest_.collectedLabels.empty()
                     ? "" : pendingRequest_.collectedLabels[0];
+                auto requestStartedAt = pendingRequest_.startedAt;
                 int fallbackFace = 0;
 
                 lock.unlock();
@@ -463,12 +483,39 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                     auto snapshots = snapshotProvider_();
                     for (const auto& s : snapshots)
                     {
-                        // Find a die that isn't the one that already reported
-                        if (s.label != reportedLabel && s.currentFace > 0)
+                        if (s.label == reportedLabel)
+                            continue;
+
+                        // Priority 1: advert debounce in progress for this disconnect event.
+                        // advertSettledFace resets after each advert-reported result, so
+                        // non-zero here means it is tracking the current roll, not a stale one.
+                        if (s.advertSettledFace > 0 && s.advertSettledCount >= 1)
+                        {
+                            fallbackFace = s.advertSettledFace;
+                            log("[RollServer] Fallback: using " + s.label +
+                                " advertSettledFace=" + std::to_string(fallbackFace) +
+                                " (count=" + std::to_string(s.advertSettledCount) + "/" +
+                                std::to_string(DieConnection::kAdvertSettledThreshold) + ")");
+                            break;
+                        }
+
+                        // Priority 2: last confirmed roll face — only if it happened
+                        // after this request started (guards against previous-generation faces).
+                        if (!s.recentRollFaces.empty() && s.hasLastRoll &&
+                            s.lastRollAt >= requestStartedAt)
+                        {
+                            fallbackFace = s.recentRollFaces.back();
+                            log("[RollServer] Fallback: using " + s.label +
+                                " recentRollFace=" + std::to_string(fallbackFace));
+                            break;
+                        }
+
+                        // Priority 3: last known GATT face (may be pre-roll, stale).
+                        if (s.currentFace > 0)
                         {
                             fallbackFace = s.currentFace;
                             log("[RollServer] Fallback: using " + s.label +
-                                " currentFace=" + std::to_string(fallbackFace));
+                                " currentFace=" + std::to_string(fallbackFace) + " (stale)");
                             break;
                         }
                     }
@@ -565,8 +612,19 @@ void RollServer::handleReadyCommand()
     log("[RollServer] Clicking BG3 window center at (" + std::to_string(cx) + ", " + std::to_string(cy) +
         ") window=(" + std::to_string(rect.left) + "," + std::to_string(rect.top) + ")-(" +
         std::to_string(rect.right) + "," + std::to_string(rect.bottom) + ")");
-    ClickClientNormalized(bg3Window, 0.50f, 0.43f);
-    //ClickWindowCenter(bg3Window);
+    // When using a controller (e.g. DualSense), BG3 is in controller mode
+    // and ignores mouse clicks until it detects real mouse activity via raw
+    // input. Move the cursor over the dice using SendInput (which generates
+    // raw-input events) to trigger the controller->mouse mode switch AND
+    // register the hover, then click once.
+    POINT pt{};
+    if (!GetClientPointOnScreen(bg3Window, 0.50f, 0.43f, pt)) return;
+
+    SetForegroundWindow(bg3Window);
+    Sleep(100);
+    MoveMouseAbsolute(pt.x, pt.y);   // raw-input move → triggers mode switch
+    Sleep(1000);                       // let BG3 switch to mouse mode + hover
+    LeftClickScreenPoint(pt);          // single click on the dice
 }
 
 void RollServer::log(const std::string& message) const

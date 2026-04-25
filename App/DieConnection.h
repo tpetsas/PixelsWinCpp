@@ -66,6 +66,8 @@ public:
     void requestPriorityReconnect();
     void suspendReconnectUntil(std::chrono::steady_clock::time_point until);
 
+    static constexpr int kAdvertSettledThreshold = 3;  // ~300-600ms at BLE advert intervals
+
 private:
     class Delegate;
 
@@ -87,7 +89,7 @@ private:
     static const char* connectionStateToString(ConnectionState state);
 
     mutable std::mutex mutex_;
-    std::mutex bleOpMutex_;  // Serializes BLE operations (connect/disconnect/reconnect)
+    std::timed_mutex bleOpMutex_;  // Serializes BLE operations (connect/disconnect/reconnect)
 
     const uint32_t targetPixelId_;
     const std::string label_;
@@ -134,7 +136,6 @@ private:
     int advertSettledFace_ = 0;
     int advertSettledCount_ = 0;
     bool advertSawRolling_ = false;  // True if rolling adverts were seen during this disconnect
-    static constexpr int kAdvertSettledThreshold = 3;  // ~300-600ms at BLE advert intervals
 
     bool hasLastRoll_ = false;
     int lastRollFace_ = 0;
