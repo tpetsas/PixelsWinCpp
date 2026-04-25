@@ -41,6 +41,11 @@ public:
     std::vector<DieStatusSnapshot> snapshotDice() const;
     bool isScanning() const;
 
+    // Suspend watchdog reconnect attempts for all non-Ready dice for the given duration.
+    // Called by RollServer at the start of a multi-die request so the BLE scanner has
+    // a clear channel to receive advertisements from disconnected dice.
+    void suspendReconnects(std::chrono::seconds duration);
+
 private:
     void startScanner();
     void stopScanner();

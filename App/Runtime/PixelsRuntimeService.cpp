@@ -93,3 +93,11 @@ bool PixelsRuntimeService::isScanning() const
 {
     return manager_ && manager_->isScanning();
 }
+
+void PixelsRuntimeService::suspendReconnects(std::chrono::seconds duration)
+{
+    if (manager_)
+    {
+        manager_->suspendReconnects(duration);
+    }
+}

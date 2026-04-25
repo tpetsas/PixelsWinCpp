@@ -66,7 +66,7 @@ public:
     void requestPriorityReconnect();
     void suspendReconnectUntil(std::chrono::steady_clock::time_point until);
 
-    static constexpr int kAdvertSettledThreshold = 3;  // ~300-600ms at BLE advert intervals
+    static constexpr int kAdvertSettledThreshold = 2;  // 2 consecutive settled adverts (~300-400ms)
 
 private:
     class Delegate;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -33,6 +34,7 @@ public:
     std::vector<DieStatusSnapshot> snapshotDice() const;
     bool isRunning() const;
     bool isScanning() const;
+    void suspendReconnects(std::chrono::seconds duration);
 
 private:
     Logger logger_;

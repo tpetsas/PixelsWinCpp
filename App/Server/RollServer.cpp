@@ -185,11 +185,13 @@ RollServer::~RollServer()
     stop();
 }
 
-void RollServer::start(DiceSnapshotProvider snapshotProvider)
+void RollServer::start(DiceSnapshotProvider snapshotProvider,
+                       DiceReconnectSuspender reconnectSuspender)
 {
     if (running_) return;
 
     snapshotProvider_ = std::move(snapshotProvider);
+    reconnectSuspender_ = std::move(reconnectSuspender);
     running_ = true;
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -231,6 +233,13 @@ void RollServer::onRoll(const std::string& label, int face)
 {
     std::lock_guard<std::mutex> lock(rollMutex_);
     if (!pendingRequest_.active) return;
+
+    // Deduplicate: if we already have a result from this die (e.g. advert path fired
+    // then GATT reconnect also fires), ignore the later duplicate.
+    for (const auto& existingLabel : pendingRequest_.collectedLabels)
+    {
+        if (existingLabel == label) return;
+    }
 
     pendingRequest_.collectedRolls.push_back(face);
     pendingRequest_.collectedLabels.push_back(label);
@@ -418,8 +427,23 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
     // not when one of two configured dice is temporarily disconnected.
     bool needsPopup = (rollsNeeded == 2 && configuredDice <= 1);
 
-    static constexpr auto kFirstRollTimeout = std::chrono::seconds(60);
+    // When no dice are currently connected, a 60s GATT wait is pointless.
+    // 20s is enough for the advertisement path to fire or a missed-roll reconnect to complete.
+    const auto kFirstRollTimeout = (connectedDice == 0)
+        ? std::chrono::seconds(20) : std::chrono::seconds(60);
+    // With reconnects suspended (see below), the advert path fires in ~1-2s.
+    // 10s is a generous safety margin.
     static constexpr auto kSecondRollTimeout = std::chrono::seconds(10);
+
+    // For multi-die requests with any disconnected die: suspend watchdog reconnect
+    // attempts immediately so the BLE scanner has a clear channel to receive
+    // advertisements. A disconnected die advertises every ~300ms; with reconnects
+    // paused, 2 consecutive settled adverts arrive in under 1s.
+    if (rollsNeeded > 1 && connectedDice < rollsNeeded && reconnectSuspender_)
+    {
+        log("[RollServer] Suspending reconnects for disconnected dice (10s) to unblock advert path");
+        reconnectSuspender_(std::chrono::seconds(10));
+    }
 
     {
         std::unique_lock<std::mutex> lock(rollMutex_);
@@ -486,10 +510,12 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                         if (s.label == reportedLabel)
                             continue;
 
-                        // Priority 1: advert debounce in progress for this disconnect event.
-                        // advertSettledFace resets after each advert-reported result, so
-                        // non-zero here means it is tracking the current roll, not a stale one.
-                        if (s.advertSettledFace > 0 && s.advertSettledCount >= 1)
+                        // Priority 1: advert debounce has reached the threshold for this
+                        // disconnect event. advertSettledFace resets after each advert-reported
+                        // result, so non-zero here means it is tracking the current roll.
+                        // Require the full threshold (not just >= 1) to avoid mid-tumble false positives.
+                        if (s.advertSettledFace > 0 &&
+                            s.advertSettledCount >= DieConnection::kAdvertSettledThreshold)
                         {
                             fallbackFace = s.advertSettledFace;
                             log("[RollServer] Fallback: using " + s.label +
@@ -510,14 +536,14 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                             break;
                         }
 
-                        // Priority 3: last known GATT face (may be pre-roll, stale).
-                        if (s.currentFace > 0)
-                        {
-                            fallbackFace = s.currentFace;
-                            log("[RollServer] Fallback: using " + s.label +
-                                " currentFace=" + std::to_string(fallbackFace) + " (stale)");
-                            break;
-                        }
+                        // Priority 3 (stale currentFace) intentionally removed.
+                        // A stale face produces a plausible-looking wrong result that BG3 cannot
+                        // detect. A timeout is always preferable to a silent wrong answer.
+                        log("[RollServer] Fallback: " + s.label +
+                            " — no reliable face available (currentFace=" +
+                            std::to_string(s.currentFace) +
+                            (s.wasRollingAtDisconnect ? ", was rolling at disconnect" : "") +
+                            "); will timeout");
                     }
                 }
                 lock.lock();

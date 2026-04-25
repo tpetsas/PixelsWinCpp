@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -18,6 +19,10 @@ class RollServer
 public:
     using Logger = std::function<void(const std::string&)>;
     using DiceSnapshotProvider = std::function<std::vector<DieStatusSnapshot>()>;
+    // Called when a multi-die request starts and any die is not Ready.
+    // Suspends watchdog reconnect attempts so the BLE scanner has a clear
+    // channel to receive advertisements from the disconnected die.
+    using DiceReconnectSuspender = std::function<void(std::chrono::seconds)>;
 
     explicit RollServer(Logger logger = nullptr);
     ~RollServer();
@@ -25,7 +30,8 @@ public:
     RollServer(const RollServer&) = delete;
     RollServer& operator=(const RollServer&) = delete;
 
-    void start(DiceSnapshotProvider snapshotProvider);
+    void start(DiceSnapshotProvider snapshotProvider,
+               DiceReconnectSuspender reconnectSuspender = nullptr);
     void stop();
 
     // Called by DieConnection::markRollResult via the RollObserver chain
@@ -43,6 +49,7 @@ private:
 
     Logger logger_;
     DiceSnapshotProvider snapshotProvider_;
+    DiceReconnectSuspender reconnectSuspender_;
 
     std::thread serverThread_;
     std::atomic<bool> running_ = false;

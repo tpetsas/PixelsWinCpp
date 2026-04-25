@@ -31,4 +31,9 @@ struct DieStatusSnapshot
     // where the die was rolling; resets to 0 after each advert-reported result)
     int advertSettledFace = 0;
     int advertSettledCount = 0;
+
+    // True if the die was physically rolling (rollState == Rolling/Handling) when BLE dropped.
+    // currentFace is unreliable in this case — it's wherever the die was mid-tumble, not
+    // the final landed face. Do not use it as a fallback result when this is true.
+    bool wasRollingAtDisconnect = false;
 };

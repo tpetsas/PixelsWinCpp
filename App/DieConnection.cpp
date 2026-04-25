@@ -178,6 +178,15 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
         // even during Reconnecting — the next reconnect attempt will use fresh data
         lastScannedPixel_ = scannedPixel;
 
+        // Seed missed-roll state from advert if we've never connected via GATT.
+        // Without this, processAdvertisement() ignores all adverts because
+        // faceBeforeDisconnect_ stays 0 until the first GATT disconnect event.
+        if (faceBeforeDisconnect_ == 0)
+        {
+            faceBeforeDisconnect_ = static_cast<int>(scannedPixel->currentFace());
+            rollStateBeforeDisconnect_ = scannedPixel->rollState();
+        }
+
         if (connectionState_ == ConnectionState::Connecting ||
             connectionState_ == ConnectionState::Reconnecting)
         {
@@ -555,6 +564,8 @@ DieStatusSnapshot DieConnection::snapshot() const
     snapshot.recentRollFaces = recentRollFaces_;
     snapshot.advertSettledFace = advertSettledFace_;
     snapshot.advertSettledCount = advertSettledCount_;
+    snapshot.wasRollingAtDisconnect = (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                                       rollStateBeforeDisconnect_ == PixelRollState::Handling);
 
     if (pixel_)
     {
@@ -654,8 +665,9 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
         std::lock_guard<std::mutex> lock(mutex_);
         savedFace = faceBeforeDisconnect_;
         savedRollState = rollStateBeforeDisconnect_;
-        faceBeforeDisconnect_ = 0;  // Reset so we don't double-count
-        rollStateBeforeDisconnect_ = PixelRollState::Unknown;
+        // Do NOT clear here — keep rollStateBeforeDisconnect_ set until after
+        // markRollResult, so that snapshot() correctly reports wasRollingAtDisconnect
+        // during the RollServer fallback window. Cleared at the end of this function.
     }
 
     if (!pixel || savedFace == 0)
@@ -673,8 +685,6 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
     // Case 1: Die was mid-roll at disconnect time. Any settled face after
     // reconnect is the result of that roll, even if it coincidentally matches
     // the transient face we last saw while tumbling.
-    // This is a genuine physical roll — notify the roll observer so the
-    // RollServer can use it (e.g. when the user rolled during a disconnect).
     if (wasRolling && isAtRest)
     {
         log("[missed-roll] Die was rolling at disconnect (face=" + std::to_string(savedFace) +
@@ -682,20 +692,30 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
             ") -> landed on " + std::to_string(newFace) +
             " (rollState=" + std::to_string(static_cast<int>(currentRollState)) + ")");
         markRollResult(newFace, /*isMissedRoll=*/false);
+        // Clear after markRollResult so wasRollingAtDisconnect stays accurate in snapshot
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            faceBeforeDisconnect_ = 0;
+            rollStateBeforeDisconnect_ = PixelRollState::Unknown;
+        }
         return;
     }
 
     // Case 2: Die was at rest at disconnect time but face changed —
     // it was rolled and settled during the disconnect window.
-    // Always record as a missed roll: the post-reconnect face is authoritative,
-    // and rollState decays from OnFace to None over time, so after a prolonged
-    // disconnect any real roll will show rollState=5.
     if (!wasRolling && newFace != savedFace && isAtRest)
     {
         log("[missed-roll] Face changed from " + std::to_string(savedFace) +
             " to " + std::to_string(newFace) + " during disconnect (rollState=" +
             std::to_string(static_cast<int>(currentRollState)) + ")");
-        markRollResult(newFace, /*isMissedRoll=*/true);
+        markRollResult(newFace, /*isMissedRoll=*/false);
+    }
+
+    // Clear after markRollResult to prevent double-counting on next reconnect
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        faceBeforeDisconnect_ = 0;
+        rollStateBeforeDisconnect_ = PixelRollState::Unknown;
     }
 }
 
@@ -831,6 +851,7 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
                 advertSettledFace_ = 0;
                 advertSettledCount_ = 0;
                 reportFace = advFace;
+                reportWasRolling = true;  // 3-consecutive settled adverts on a new face is a real roll
             }
             else
             {
@@ -841,10 +862,6 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
         }
     }
 
-    // markRollResult acquires mutex_ internally, must call outside the lock
-    // If the die was genuinely rolling, this is a real roll (isMissedRoll=false)
-    // so the RollServer gets notified. If it was at rest and face changed,
-    // it's ambiguous (isMissedRoll=true) — record but don't trigger the server.
     if (reportFace > 0)
     {
         markRollResult(reportFace, /*isMissedRoll=*/!reportWasRolling);

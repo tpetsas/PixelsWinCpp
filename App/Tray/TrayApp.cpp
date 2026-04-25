@@ -290,11 +290,17 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
         MessageBoxW(windowHandle_, L"Failed to start runtime service.", L"Pixels Tray", MB_ICONERROR | MB_OK);
     }
 
-    // Start the roll server — it provides dice snapshot info to determine connected dice count
-    rollServer_->start([this]() -> std::vector<DieStatusSnapshot>
-    {
-        return runtime_ ? runtime_->snapshotDice() : std::vector<DieStatusSnapshot>{};
-    });
+    // Start the roll server with snapshot and reconnect-suspend callbacks
+    rollServer_->start(
+        [this]() -> std::vector<DieStatusSnapshot>
+        {
+            return runtime_ ? runtime_->snapshotDice() : std::vector<DieStatusSnapshot>{};
+        },
+        [this](std::chrono::seconds duration)
+        {
+            if (runtime_) runtime_->suspendReconnects(duration);
+        }
+    );
 
     SetTimer(windowHandle_, kTooltipTimerId, 1200, nullptr);
     SetTimer(windowHandle_, kNotificationTimerId, 3000, nullptr);
