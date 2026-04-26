@@ -438,24 +438,15 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
     // 15s provides ~3-5s of headroom past the typical 10-12s Windows advert delay.
     static constexpr auto kSecondRollTimeout = std::chrono::seconds(15);
 
-    // Suspend watchdog reconnect attempts so the BLE scanner has a clear channel
-    // for advert-based roll recovery during this request window.
-    // For 2-die requests, pre-arm for the full first-roll timeout so that a Ready
-    // die which disconnects mid-request is also covered (Fix A.1+A.2: the watchdog
-    // checks reconnectSuspendedUntil_ before firing, so even a die that just
-    // disconnected won't start reconnecting during the request window).
+    // Pre-arm suspension for all roll modes so the BLE scanner has a clear channel
+    // for advert-based roll recovery. The watchdog checks reconnectSuspendedUntil_
+    // before firing, so even a die that disconnects mid-roll won't trigger GATT
+    // reconnect retries that flood the scanner and starve the advert fast-path.
     if (reconnectSuspender_)
     {
-        if (rollsNeeded == 2)
-        {
-            log("[RollServer] Pre-arming reconnect suspension for 2-die request (25s)");
-            reconnectSuspender_(kFirstRollTimeout);
-        }
-        else if (connectedDice < configuredDice)
-        {
-            log("[RollServer] Suspending reconnects for disconnected dice (10s) to unblock advert path");
-            reconnectSuspender_(std::chrono::seconds(10));
-        }
+        log("[RollServer] Pre-arming reconnect suspension for " + mode + " request (" +
+            std::to_string(kFirstRollTimeout.count()) + "s)");
+        reconnectSuspender_(kFirstRollTimeout);
     }
 
     {

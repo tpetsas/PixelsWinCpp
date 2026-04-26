@@ -454,9 +454,99 @@ A new **GATT reconnect wait stage** in `RollServer::waitForRolls`, inserted betw
 - **No regression risk for normal-path latency**: the suspension lift only happens after the entire previous fallback chain has missed, by which point the user has already waited 23s. Adding up to 10s on top is strictly preferable to returning a wrong answer.
 - **Hard ceiling**: 33s total latency (15s + 8s + 10s post-first-roll). Beyond this, P4 stale `currentFace` is still returned so `{"error":"timeout"}` does not surface to the client.
 
+### 🟡 Planned (Session 12 — from 2026-04-26 BG3 real-session log analysis)
+
+First real BG3 gameplay session with the Session 11 build. The user reported: most rolls fine, some delayed, a few (especially early on) never arrived — forcing manual rolls in-game. Deep-dive of `pixels_log.txt`, `client_log.txt`, and `bg3-smart-dice-rolls\logs\smart-dice-rolls.log` identified three root causes.
+
+#### Two confirmed missed rolls
+
+**Missed Roll A — normal gen 1 (second BG3 session)**
+- Die 1 disconnected mid-roll (rollState=3, face=14)
+- Immediate GATT reconnect fired (`Connection error: 1` × 2), flooding the BLE radio
+- Advert path saw the settled face (face=13) but ~2–3s too late — first-roll timeout had already fired
+- `[missed-roll]` log entry confirms correct face was 13; by then the error was already sent to BG3
+
+**Missed Roll B — normal gen 14**
+- Die 1 AND die 2 both disconnected simultaneously during the roll
+- GATT reconnect retries from both dice competed on the radio for the entire timeout window
+- Advert settled on face=20 for die 1 after the timeout; never reached BG3
+
+In both cases the advert path DID deliver the correct answer — just after the deadline, because GATT reconnect was clogging the radio.
+
+#### Root cause 1 — GATT reconnect not suspended for normal 1-die rolls
+
+The pre-arm suspension (Fix A.2, Session 4) only fires for 2-die (advantage/disadvantage) requests. For normal single-die rolls, suspension is issued only if a die is ALREADY disconnected at request start. When a die disconnects MID-ROLL during a normal request, the watchdog immediately fires GATT reconnect retries that flood the BLE scanner, starving the advert path. The advert path detects the correct face but consistently a few seconds after the timeout.
+
+#### Root cause 2 — First-roll timeout gives no headroom for worst-case radio contention
+
+With two GATT reconnect streams competing (Missed Roll B), the advert path had zero clear scan windows until after the 25s timeout. A dynamic extension on mid-roll disconnect (matching the existing extension logic for the second-roll path) would give 8s of additional advert-only time.
+
+#### Root cause 3 — Advert debounce requires 2 consecutive packets, adding 2–4s even on the fast path
+
+The 2-packet debounce was designed to filter "die bumped on shelf" false positives (rollState was idle throughout). When a die was VISIBLY TUMBLING (rollState=3) at the time of disconnect, a single subsequent settled advert is unambiguous evidence — the die has stopped. The extra debounce cycle adds 2–4s latency on the advert path and, in the missed-roll cases, was the margin that pushed recovery past the deadline.
+
+#### Fix implemented (Session 12)
+
+**Fix 1 — Pre-arm reconnect suspension for ALL roll modes** (`RollServer.cpp`) ✅ DONE
+- Previously the suspension pre-arm fired only for 2-die (advantage/disadvantage) requests, or for 1-die when a die was already disconnected at request start.
+- When both dice were connected at the start of a normal 1-die request and one disconnected mid-roll, no suspension was in place. The watchdog fired `immediateReconnectRequested_` immediately, hammering GATT retries that flooded the BLE scanner and starved the advert fast-path.
+- Fix: removed the `rollsNeeded == 2` / `connectedDice < configuredDice` conditional and replaced with an unconditional `reconnectSuspender_(kFirstRollTimeout)` for all modes.
+- One block changed in `RollServer::waitForRolls()`.
+- **Expected effect**: advert path gets clear, uncontested bandwidth for ALL roll modes whenever a die disconnects mid-roll.
+
+**Fix 2 — Dynamic first-roll extension** — NOT NEEDED
+- With Fix 1 in place, the advert path fires in 3–8s, well within the existing 25s `kFirstRollTimeout`. The 25s window already provides ~17–22s of headroom after the advert fast-path delivers.
+- Would only help if Windows BLE suppresses adverts for >25s, which is beyond anything observed in testing (~23s was the worst case).
+
+**Fix 3 — Reduce advert debounce to 1 packet when `wasRollingAtDisconnect=true`** — ALREADY IMPLEMENTED
+- The `unambiguousSettle` condition in `processAdvertisement` (`DieConnection.cpp`) already accepts a single packet when `rollStateBeforeDisconnect_ ∈ {Rolling, Handling}` AND `advFace != compareBaseline` AND `advRollState != Crooked`.
+- The missed-roll cases (face=14→13, face=4→20) both had different disconnect vs. settled faces, so the fast-path single-packet logic would have fired — the real issue was that NO adverts arrived before the timeout due to radio flooding (root cause 1).
+- The 2-packet debounce is still correctly used for the "settled on same face as tumbling face" case (unambiguous false-positive risk), and "die was at rest at disconnect" case. No change needed.
+
+#### Expected timing after all three fixes
+
+| Path | Current avg | Current worst | After avg | After worst |
+|---|---|---|---|---|
+| GATT fast path (dice stay connected) | 2–3s | 4s | 2–3s | 4s (unchanged) |
+| Die disconnects mid-roll, advert fast-path | 3–8s | 12s | 3–5s | 8s |
+| Die disconnects mid-roll, advert debounce path | 8–20s | 25s → miss | 3–6s | 10s |
+| Both dice disconnect simultaneously | 25s → miss | 25s → miss | 8–15s | 33s (correct) |
+| Advert suppressed >23s (extreme radio) | 23–33s (may be wrong) | 33s | 23–33s (correct via GATT reconnect stage) | 33s |
+
+**Summary targets:**
+- **Average roll (all modes, real BG3 session):** 3–5s (down from ~8–12s observed)
+- **P90:** ~8s (down from ~20s)
+- **P99 / worst case:** ~33s (hard ceiling from 15s second-roll + 8s extension + 10s GATT reconnect stage)
+- **Missed rolls:** eliminated — the advert path with suspension + reduced debounce should always deliver within the extended first-roll window
+- **Wrong-face results:** unchanged / already handled by Session 9–11 GATT reconnect stage
+
+---
+
 ### 🔵 Future work — activate if instability returns
 
 The following improvements were analysed and deprioritised while the current implementation is stable. Revisit if a real BG3 session surfaces new failure modes.
+
+#### FW-0: Slow-roll notification overlay (UX)
+
+When a roll is taking too long (dice connectivity issues), show a non-intrusive transparent overlay in the top-right corner of the screen so the user knows something is still in progress rather than staring at a frozen roll dialog.
+
+**Behaviour:**
+- Appears after the roll has been waiting for **≥10 seconds** with no result yet
+- Non-focus-stealing: `WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE` so BG3 never loses focus and mouse clicks / controller input still land on the game
+- Content: playful character (e.g. a small d20 emoji/icon) + short message ("Your dice are rolling through the aether...") + live countdown showing time remaining until the worst-case deadline
+- Countdown is based on how much of the 33s worst-case budget remains
+- Dismissed automatically the moment the result is delivered to BG3
+- Tone is playful / on-brand ("The dice spirits are pondering your fate...") — not a scary error
+
+**Implementation sketch:**
+- Create a borderless layered window (`WS_POPUP`, `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`) — the `WS_EX_NOACTIVATE` flag is the key to never stealing focus
+- Draw with GDI or Direct2D; semi-transparent black pill background + white text
+- `RollServer` exposes a `SlowRollObserver` callback that fires at t=10s into a roll request and again when the roll completes; `TrayApp` wires this to show/hide the window
+- Countdown timer via `SetTimer` on the overlay window; dismissed by posting `WM_CLOSE` or hiding via `ShowWindow(SW_HIDE)`
+
+**When to activate:** once the core BLE stability improvements are shipped and tested. This is purely a polish/UX layer — it doesn't affect roll correctness.
+
+---
 
 #### FW-1: Cached GATT service discovery (`Peripheral.cpp:108,160`)
 
