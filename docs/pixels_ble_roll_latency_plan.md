@@ -1,7 +1,7 @@
 # Pixels Windows BLE Roll-Latency Stabilization Plan
 
 **Date:** 2026-04-24  
-**Last updated:** 2026-04-25 (Session 7 — unambiguousSettle missing advertSawRolling_, snapshot accepts mid-roll face)  
+**Last updated:** 2026-04-25 (Session 11 — GATT reconnect wait stage after exhausted extension)  
 **Branch context:** `server-mode` branch, with uploaded `diff.txt` and `pixels_log-big-session.txt.txt`  
 **Primary goal:** after the user physically rolls a Pixel die, return the roll result as fast as possible, ideally within a few seconds, even when Windows BLE/GATT is flaky.
 
@@ -281,6 +281,178 @@ Deep analysis of the Session 6 `pixels_log.txt` (40 rolls, 3 timeouts: disadvant
 - **Disadvantage gen5/gen11/gen16-style timeouts**: should drop to near zero. The single settled advert is now accepted immediately via the fast-path once `advertSawRolling_=true`, eliminating the 2-packet deadlock that caused the timeout when only one advert arrived before the window closed.
 - **Wrong result from snapshot recovery (gen8 pattern)**: eliminated. The rollState guard ensures only truly-settled faces are accepted from the polling fallback.
 - **Overall**: with Sessions 6 + 7 combined, the main remaining timeout scenario was the advert-recovery-induced `rollStateBeforeDisconnect_=OnFace` resetting the fast-path. That gap is now closed.
+
+### ✅ Done (Session 8 — 2026-04-25, last-resort fallback eliminates timeout errors)
+
+Test session showed two ~18s timeouts (advantage gen7, disadvantage gen11) after Session 7 fixes. All other rolls completed in 2-5s.
+
+#### Root cause of remaining timeouts
+
+Both timeouts follow the same second-roll-window pattern: first roll arrives ~3s into the request, second die's BLE advert suppression window runs slightly longer than usual (~12-14s instead of typical 10-12s), leaving only 1-3s of advert coverage before the 15s window closes.
+
+The slow advert path requires `kAdvertSettledThreshold=2` consecutive settled packets. When Windows delivers adverts late enough that only a single packet arrives before the deadline, the debounce count reaches 1 but not 2 → `advertSettledFace > 0, advertSettledCount = 1` → timeout.
+
+The `currentFace` field (in snapshot) for disconnected dice reflects whatever face the die last reported via GATT. If the die reconnected briefly after settling (common), this is the correct post-roll face. If `wasRollingAtDisconnect=true`, it may be a mid-tumble stale face.
+
+#### Fixes implemented (Session 8)
+
+Extended the second-roll timeout fallback in `RollServer.cpp` with two additional priority levels:
+
+- **Priority 3 — single-advert `advertSettledFace`** (`RollServer.cpp`):
+  - After priorities 1 (full-debounce advert) and 2 (confirmed GATT roll), now checks `advertSettledFace > 0` with any count, not just `>= kAdvertSettledThreshold`.
+  - Rationale: the 2-packet debounce guards against mid-tumble false positives during active rolling. At timeout (18s total), rolling is long over — a single advert at this point reliably represents the settled face.
+  - Directly fixes the gen7/gen11 pattern: `advertSettledFace` is set to the correct face but `advertSettledCount=1` was previously rejected.
+
+- **Priority 4 — `currentFace` last resort** (`RollServer.cpp`):
+  - If no advert data is available at all, uses `snapshot.currentFace` (if non-zero).
+  - If `wasRollingAtDisconnect=false`: die was idle at disconnect, `currentFace` is the last GATT-reported settled face (likely correct post-roll if die reconnected briefly after settling).
+  - If `wasRollingAtDisconnect=true`: die was mid-tumble at disconnect, face may be stale — logged clearly as uncertain. Still returned instead of error, per user preference: any face value is better than a timeout from BG3's perspective.
+  - The one remaining case that still returns `{"error":"timeout"}` is `currentFace=0` — die was never connected long enough to report a face at all. This is extremely rare.
+
+#### Expected impact after Session 8
+
+- **~18s timeout (gen7/gen11 pattern)**: eliminated. Single-advert data is now accepted as priority 3 instead of being discarded when `count < threshold` at timeout.
+- **Worst-case scenario (no advert data, die reconnected after roll)**: now returns `currentFace` instead of timeout. Only risk is a stale pre-roll face if the die never reconnected, but at 18s this is extremely unlikely.
+- **`{"error":"timeout"}` responses**: should be eliminated entirely for normal gameplay where dice are within BLE range.
+
+### ✅ Done (Session 9 — 2026-04-25, extension wait converts stale-rolling P4 into correct advert result)
+
+Test session showed `advantage gen5` returning `{"die1": 19, "die2": 11}` at 19125ms when the correct second face was 19. The wrong `die2=11` value came from the Session 8 P4 last-resort `currentFace` fallback firing on a die whose `wasRollingAtDisconnect=true` — i.e. `currentFace=11` was the mid-tumble face the die had when GATT dropped, not the face it eventually settled on.
+
+#### Root cause of remaining wrong-face result
+
+The full sequence:
+
+- t=0: 2-die request starts, both dice Ready
+- t=~4s: die 1 rolls (face=19) via GATT — first roll complete, 15s second-roll window starts
+- die 2 disconnects at some point during the request
+- die 2 physically settles on face=19 after disconnecting
+- Windows BLE suppresses adverts from die 2 for ~10-15s after disconnect (OS-level limitation, scanner is already running)
+- 15s second-roll window closes at t=~19s with NO advert data received for die 2
+- P1 (full-count advert): `advertSettledFace=0` → miss
+- P2 (`recentRollFaces` after `requestStart`): empty → miss
+- P3 (single-advert): `advertSettledFace=0` → miss
+- P4 (`currentFace`): `currentFace=11` (last GATT-reported face, pre-roll/mid-tumble) → WRONG
+
+The advert carrying face=19 arrives at ~t=19-21s — just after the window closed. A 1-3s extension would have caught it.
+
+#### Why `kSecondRollTimeout` isn't simply increased
+
+Increasing the global second-roll timeout to 18-20s would penalise every 2-die roll by 3-5s in the worst case, even when the result is already in via GATT or earlier-arriving adverts. The targeted extension only fires for the specific stale-rolling P4 case, leaving normal-path latency untouched.
+
+#### Fix implemented (Session 9)
+
+Restructured the `!gotSecond` fallback block in `RollServer::waitForRolls`:
+
+- **Capture per-snapshot context** — extracted P1/P2/P3 logic into a `tryAdvertFallbacks` lambda that records the missing die's `wasRollingAtDisconnect` and `currentFace` (and label) on every pass, so the extension-wait phase can re-poll without losing context.
+
+- **P4 split by `wasRollingAtDisconnect`** — when P1/P2/P3 fail:
+  - If `wasRollingAtDisconnect=false` and `currentFace > 0`: use `currentFace` immediately as P4 (die was idle at disconnect, face is the last GATT-reported settled value — reliable).
+  - If `wasRollingAtDisconnect=true`: enter a NEW **extension wait** loop for up to 4s.
+
+- **Extension wait loop** — every 500ms during the 4s window:
+  - Calls `rollCv_.wait_for(slice)` so a `markRollResult` from the advert path can complete the request directly.
+  - Polls `snapshotProvider_()` and re-runs `tryAdvertFallbacks` (P1/P2/P3) — if `advertSettledFace` becomes non-zero, accept it (P3 still fires on count=1 at this point, since rolling is long over).
+  - Breaks immediately on success (label suffix `fallback-extension` for traceability).
+
+- **Refresh reconnect suspension during extension** — the existing 15s `kSecondRollTimeout` suspension would expire mid-extension; calling `reconnectSuspender_(kExtensionWindow + 1s)` keeps the watchdog from starting a reconnect that would block the very adverts we're waiting for.
+
+- **Stale-`currentFace` only after extension fails** — only if the 4s extension yields no advert data and no `rollCv_` notification do we fall back to `currentFace` with the explicit "uncertain — was rolling at disconnect" log message. This is the absolute last resort, kept so a face is always returned in preference to `{"error":"timeout"}`.
+
+#### Expected impact after Session 9
+
+- **`advantage gen5`-style wrong result** (advert arrives 1-3s after deadline, P4 returns mid-tumble face): converted into a correct result in ≤4 extra seconds. Total request latency rises from ~19s to ~21-23s in this exact case, but the answer is correct.
+- **All other paths unaffected**: normal GATT, mid-request GATT recovery, advert fast-path, P1/P2/P3 fallbacks, idle-at-disconnect P4 — none touch the extension wait. The extension only fires when P1/P2/P3 all miss AND the missing die was physically rolling at disconnect time.
+- **Windows BLE OS-level advert suppression** (~10-15s post-disconnect) is not fixable from user-mode; the extension is the minimum-cost workaround that captures the typical late-arriving advert without penalising any other case.
+
+### ✅ Done (Session 10 — 2026-04-25, advert-while-Ready + longer extension wait)
+
+Test session showed the advert path doing all the heavy lifting on slow 2-die rolls. Slow rolls (13–21s) all matched the pattern: one die disconnected mid-request, Windows BLE suppressed its adverts for 10–20+ seconds, and the result trickled in via the late advert path. One concrete failure: `advantage gen5` returned `die1: 15, die2: 12` at 21.1s where the correct second face was 3 — `currentFace=12` was die2's pre-roll face, returned by P4 because the late advert arrived ~1–2s after the 15s + 4s budget expired.
+
+Two distinct issues addressed:
+
+1. **The advert path is gated to `Selected`/`Reconnecting`, so a Ready die that silently drops a GATT `onRolled` notification has no fast recovery — it must wait the full 15s second-roll window.** A connected die is *also* broadcasting advertisements at all times; we were ignoring them.
+
+2. **The 4s extension wait is too short for genuine 15–20s OS-level advert suppression.** It catches "advert arrived 1–3s late" but misses "advert arrived 5–8s late."
+
+#### Fixes implemented (Session 10)
+
+- **Fix 1 — Process adverts for `Ready` dice** (`DieConnection.cpp:processAdvertisement`):
+  - Widened the gate so `Ready` is a valid path alongside `Selected`/`Reconnecting`.
+  - For the Ready path, the comparison baseline is `pixel_->currentFace()` (the GATT-known live face) instead of `faceBeforeDisconnect_`. The latter is 0 for a die that has never disconnected.
+  - The disconnected-path early-return on `faceBeforeDisconnect_ == 0` is preserved (still blocks adverts when no GATT roll context exists). The Ready path uses its own guard: if `pixel_ == nullptr` or `currentFace() == 0`, skip.
+  - Disconnected-only bookkeeping (`faceBeforeDisconnect_`, `rollStateBeforeDisconnect_`) is *not* mutated in the Ready path — those fields belong to the disconnect tracking flow.
+  - The fast-path "was rolling at disconnect" condition (`rollStateBeforeDisconnect_ ∈ {Rolling, Handling}`) is suppressed for Ready dice; only the live `advertSawRolling_` flag (set this request cycle when the advert reports `rollState=Rolling/Handling`) qualifies a Ready die as "was rolling."
+  - Stale-debounce guard added: if a Ready die has `advertSettledFace_` accumulated from a prior partial debounce and the GATT-known face has caught up to it, reset the counts so a new roll starts cleanly.
+  - Why this is safe: `RollServer::onRoll` already deduplicates by label, so a duplicate fire (advert + GATT) is rejected. `rollObserver_` is also a no-op when no `pendingRequest_` is active. Stray adverts during quiescent periods cost nothing.
+  - Expected impact: when GATT silently drops a roll notification on a connected die, the advert path now completes the roll in ~200–400 ms (one advert interval) instead of 15s. This collapses the typical "slow 2-die" timing from 13–18s back into the 3–4s normal range.
+
+- **Fix 2 — Extension wait widened from 4s to 8s** (`RollServer.cpp:waitForRolls`):
+  - Constant `kExtensionWindow` raised to `std::chrono::seconds(8)`.
+  - Total worst-case path budget: 15s second-roll timeout + 8s extension = 23s. The gen5 case (21s with wrong P4 face) would have caught a late advert at ~22s and returned the correct face.
+  - Belt-and-suspenders relative to Fix 1 — Fix 1 should prevent the great majority of stale-P4 cases by closing GATT-drop holes before the timeout fires; the longer extension only matters for genuine multi-second OS-level advert suppression that survives Fix 1.
+  - Log message updated to "waiting up to 8s for advert data."
+
+#### Expected impact after Session 10
+
+- **Slow 2-die rolls (13–21s)**: with Fix 1, the most common cause (silent GATT drop on a still-connected die) resolves in <1s via the advert path. Expected to make these rolls indistinguishable from the 2–4s "happy path."
+- **Wrong-face P4 result (gen5 pattern)**: with Fix 2, the extension wait now extends to ~23s post-request-start, eating into the typical ceiling of Windows advert suppression. Combined with Fix 1, the case where P4 needs to fire at all should be vanishingly rare.
+- **No regression risk for normal-path**: Fix 1 only adds processing on Ready dice during request windows; the deduplication on `RollServer::onRoll` ensures no double-reporting. Fix 2 is a pure timeout extension that only fires in the extension branch (post-15s, `wasRollingAtDisconnect=true`).
+
+### ✅ Done (Session 11 — 2026-04-25, GATT reconnect wait stage after exhausted extension)
+
+Test session showed `advantage gen6` returning `{"die1": 7, "die2": 9}` at ~26.85s when the correct second face was 15. The wrong `die2=9` value came from the Session 9/10 P4 last-resort `currentFace` fallback firing on die 1 after the 8s extension yielded no advert data — `currentFace=9` was the mid-tumble face captured when GATT dropped, not the face the die settled on (15).
+
+Compare against `advantage gen5` from the same session: die 1 was already in `Reconnecting` state when the request started, so the suspension was already partially elapsed. Die 1 reconnected mid-request, `[missed-roll]` fired (face 14 → 15), `onRoll("die 1", 15)` notified `rollCv_`, and the correct result returned in 6.5s.
+
+#### Root cause of the wrong-face result on gen6
+
+The full sequence (log lines ~1806–1940):
+
+- t=0 (line 1806): 2-die `advantage gen6` request starts, both dice `Ready`. Suspension pre-armed for 25s.
+- t=~5s (line 1890): die 2 settles on face 7 via GATT — first roll complete. Suspension refreshed to 15s for the second-roll window (line 1896).
+- t=~6s (line 1902): die 1 disconnects mid-roll (`face=9, rollState=3`, RSSI=-72dBm — weaker than die 2's -68dBm). `wasRollingAtDisconnect=true`, `immediateReconnectRequested_=true`.
+- t=~6s (line 1908): BLE scanner starts for advert recovery.
+- t=6s..21s (lines 1910–1928): **Zero `[advert-debug]` lines for die 1** — Windows BLE advert suppression. Poll lines only.
+- t=~21s (line 1929): 15s second-roll window expires. P1/P2/P3 all miss (`advertSettledFace=0`, `recentRollFaces` empty, no late advert).
+- t=~21s (line 1930): 8s extension wait starts. Suspension refreshed to 9s to keep the watchdog from competing for the radio.
+- t=21s..29s (lines 1932–1938): Still no advert-debug lines. Total advert suppression now exceeds 23s.
+- t=~29s (line 1939): P4 stale `currentFace=9` returned — **wrong**.
+- t=~29s (line 1940): Response sent: `die2=9` (the stale rolling face).
+- t=~45s (line 1950): Watchdog **finally** fires for die 1 — but the response was already sent 16s earlier.
+
+The advert path simply could not deliver: Windows BLE suppressed die 1's advertisements for **more than 23 seconds** after disconnect, an extreme case beyond the typical 10–15s ceiling Session 9/10 was tuned for. By the time the watchdog was allowed to attempt a GATT reconnect (after the suspension expired and the 30s default backoff completed), the response had already been sent with the stale face.
+
+#### Why simply lengthening the extension wait isn't the answer
+
+A 30s+ extension would fix this case but penalises every wrong-face request by an extra ~22s on top of the existing 23s budget. The advert path is not guaranteed to deliver on this timescale — the radio environment can be hostile enough that adverts simply do not flow. A bounded, deterministic recovery path is needed.
+
+#### Fix implemented (Session 11)
+
+A new **GATT reconnect wait stage** in `RollServer::waitForRolls`, inserted between the extension wait and the existing P4 stale-`currentFace` fallback, only firing when the extension yielded nothing AND `wasRollingAtDisconnect=true`:
+
+- **Lift the reconnect suspension** by calling `reconnectSuspender_(std::chrono::seconds(0))`. Passing 0 sets `reconnectSuspendedUntil_ = now + 0 = now`, which the watchdog interprets as "no longer suspended" on its next tick. `immediateReconnectRequested_` was already set on the disconnect event, so the watchdog fires immediately on the next poll cycle.
+
+- **Wait on `rollCv_` for up to 10s**, polling every 500ms. During this window:
+  - If the GATT reconnect succeeds, `checkMissedRoll` fires and calls `onRoll(missingDieLabel, settledFace)` → `rollCv_.notify_all()` → request completes correctly. The dedup guard in `onRoll` (label not yet in `collectedLabels`) ensures the missed-roll face is accepted.
+  - As a backstop, every 500ms re-snapshot and check whether the missing die is now `Ready` with a `currentFace` that differs from the stale one captured at disconnect. This catches the edge case where `checkMissedRoll` raced with our wait or did not fire (e.g. the die never had a confirmed `faceBeforeDisconnect_` baseline). When this fires, label suffix is `fallback-reconnect` for traceability.
+
+- **Fall through to P4 only if GATT reconnect also yielded nothing** — preserves the existing "always return a face" guarantee (better than `{"error":"timeout"}` from the user's perspective) while making the wrong-face path strictly the third-choice last resort.
+
+#### Correctness points
+
+- `pendingRequest_.active` stays `true` throughout the reconnect wait (the response hasn't been sent yet), so `onRoll` from `checkMissedRoll` is accepted normally.
+- The `onRoll` deduplication on label ensures a `checkMissedRoll`-driven fire is not rejected (the missing die never reported during this request, so its label is absent from `collectedLabels`).
+- The fix is entirely additive — when the extension wait succeeds (the common case), we never enter the new branch.
+- Worst-case path budget: 25s first-roll timeout (pre-arm) is the wall-clock ceiling for the first roll; for the second roll: 15s window + 8s extension + 10s GATT reconnect wait = **33s worst case**. Slow, but always better than the wrong answer.
+- Typical successful reconnect path (gen5-style): ~3s for the watchdog to fire + GATT discovery + `checkMissedRoll`. So total request latency rises from ~23s (wrong) to ~26s (correct) in cases where the extension would have lost.
+
+#### Expected impact after Session 11
+
+- **`advantage gen6`-style wrong-face result** (advert suppression > 23s, `wasRollingAtDisconnect=true`, P4 returns mid-tumble face): converted into a correct result in ≤10 extra seconds in the typical case where the die can be reconnected. Total request latency rises from ~26s (wrong) to ~26–33s (correct).
+- **Healthy paths unaffected**: GATT-fast-path (no disconnect), GATT mid-request reconnect (Session 5/9 paths), advert fast-path (Session 10), P1/P2/P3 fallbacks, idle-at-disconnect P4 — none reach the new GATT reconnect wait stage. The new branch only fires when (a) the second roll fully timed out, (b) the missing die was rolling at disconnect, AND (c) the 8s extension yielded nothing.
+- **No regression risk for normal-path latency**: the suspension lift only happens after the entire previous fallback chain has missed, by which point the user has already waited 23s. Adding up to 10s on top is strictly preferable to returning a wrong answer.
+- **Hard ceiling**: 33s total latency (15s + 8s + 10s post-first-roll). Beyond this, P4 stale `currentFace` is still returned so `{"error":"timeout"}` does not surface to the client.
 
 ### 🔵 Future work — activate if instability returns
 

@@ -746,27 +746,63 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // Only process while disconnected and waiting for reconnect
-        if (connectionState_ != ConnectionState::Selected &&
-            connectionState_ != ConnectionState::Reconnecting)
+        // Process while disconnected/reconnecting OR while still Ready: a Ready die
+        // is also broadcasting advertisements, and they let us catch a roll whose
+        // GATT onRolled notification was silently dropped by the Windows BLE stack.
+        // (Session 10 Fix 1: widen gate to include Ready.)
+        const bool isDisconnectedPath =
+            (connectionState_ == ConnectionState::Selected ||
+             connectionState_ == ConnectionState::Reconnecting);
+        const bool isReadyPath = (connectionState_ == ConnectionState::Ready);
+        if (!isDisconnectedPath && !isReadyPath)
         {
             return;
         }
 
-        // Already recovered the roll via advert (or no disconnect state saved)
-        if (faceBeforeDisconnect_ == 0)
+        // For the Ready path, use the current GATT-known face as the baseline so we
+        // can detect a face change reported only via advert. Skip if no face known.
+        int readyBaseline = 0;
+        if (isReadyPath)
         {
-            return;
+            if (!pixel_) return;
+            readyBaseline = pixel_->currentFace();
+            if (readyBaseline == 0) return;
+        }
+        else
+        {
+            // Disconnected path: original guard — already recovered the roll via advert
+            // (or no disconnect state saved). Does NOT apply to Ready path because a
+            // connected die that has never disconnected has faceBeforeDisconnect_ == 0.
+            if (faceBeforeDisconnect_ == 0)
+            {
+                return;
+            }
         }
 
         const int advFace = scannedPixel->currentFace();
         const auto advRollState = scannedPixel->rollState();
 
+        // Comparison baseline: for Ready dice, use the GATT-known current face; for
+        // disconnected dice, use the saved face from the last GATT disconnect event.
+        const int compareBaseline = isReadyPath ? readyBaseline : faceBeforeDisconnect_;
+
+        // For Ready path: if the GATT-known face has caught up to (or moved past) any
+        // previously accumulated debounce state, it means the prior roll completed via
+        // GATT and the partial counts are stale. Clear them so a new roll starts fresh.
+        if (isReadyPath && advertSettledFace_ != 0 && advertSettledFace_ == compareBaseline)
+        {
+            advertSettledFace_ = 0;
+            advertSettledCount_ = 0;
+            advertSawRolling_ = false;
+        }
+
         // Debug: log every advertisement received while waiting for recovery
         log("[advert-debug] face=" + std::to_string(advFace) +
             ", rollState=" + std::to_string(static_cast<int>(advRollState)) +
+            ", baseline=" + std::to_string(compareBaseline) +
             ", settledFace=" + std::to_string(advertSettledFace_) +
-            ", settledCount=" + std::to_string(advertSettledCount_));
+            ", settledCount=" + std::to_string(advertSettledCount_) +
+            (isReadyPath ? ", path=ready" : ", path=disc"));
 
         // Die still rolling — not settled yet, reset debounce and keep listening
         if (advRollState == PixelRollState::Rolling ||
@@ -780,9 +816,12 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
         }
 
         // Die is settled (OnFace or Crooked). Check if this is a missed roll.
+        // For Ready path, rollStateBeforeDisconnect_ is irrelevant — only the live
+        // advertSawRolling_ flag (set this request cycle) counts.
         const bool wasRolling = advertSawRolling_ ||
-                                (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
-                                 rollStateBeforeDisconnect_ == PixelRollState::Handling);
+                                (!isReadyPath &&
+                                 (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                                  rollStateBeforeDisconnect_ == PixelRollState::Handling));
 
         if (wasRolling)
         {
@@ -795,20 +834,26 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
             // die was visibly rolling in adverts before settling.
             // Exclude Crooked(4): that state means the die is not properly settled.
             const bool unambiguousSettle =
-                (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
-                 rollStateBeforeDisconnect_ == PixelRollState::Handling ||
+                ((!isReadyPath &&
+                  (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                   rollStateBeforeDisconnect_ == PixelRollState::Handling)) ||
                  advertSawRolling_) &&
                 advRollState != PixelRollState::Crooked &&
-                advFace != faceBeforeDisconnect_;
+                advFace != compareBaseline;
 
             if (unambiguousSettle)
             {
                 log("[advert-recovery] Fast-path settle: rolling->settled face=" +
                     std::to_string(advFace) + " (was face=" +
-                    std::to_string(faceBeforeDisconnect_) + ", advRollState=" +
-                    std::to_string(static_cast<int>(advRollState)) + ")");
-                faceBeforeDisconnect_ = advFace;
-                rollStateBeforeDisconnect_ = advRollState;
+                    std::to_string(compareBaseline) + ", advRollState=" +
+                    std::to_string(static_cast<int>(advRollState)) +
+                    (isReadyPath ? ", ready-path)" : ")"));
+                if (!isReadyPath)
+                {
+                    // Disconnected-path bookkeeping only — Ready path leaves these alone
+                    faceBeforeDisconnect_ = advFace;
+                    rollStateBeforeDisconnect_ = advRollState;
+                }
                 advertSettledFace_ = 0;
                 advertSettledCount_ = 0;
                 advertSawRolling_ = false;
@@ -840,12 +885,16 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
 
                 log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
                     std::to_string(advFace) + " (was face=" +
-                    std::to_string(faceBeforeDisconnect_) + ", rollState=" +
+                    std::to_string(compareBaseline) + ", rollState=" +
                     std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
-                    ", settled count=" + std::to_string(advertSettledCount_) + ")");
+                    ", settled count=" + std::to_string(advertSettledCount_) +
+                    (isReadyPath ? ", ready-path)" : ")"));
 
-                faceBeforeDisconnect_ = advFace;
-                rollStateBeforeDisconnect_ = advRollState;
+                if (!isReadyPath)
+                {
+                    faceBeforeDisconnect_ = advFace;
+                    rollStateBeforeDisconnect_ = advRollState;
+                }
                 advertSettledFace_ = 0;
                 advertSettledCount_ = 0;
                 advertSawRolling_ = false;
@@ -853,7 +902,7 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
                 reportWasRolling = true;
             }
         }
-        else if (advFace != faceBeforeDisconnect_)
+        else if (advFace != compareBaseline)
         {
             // Face changed while die was at rest. Accept any non-rolling state —
             // this includes rollState=5 (firmware idle, not in C++ SDK enum) which
@@ -884,12 +933,16 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
 
                 log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
                     std::to_string(advFace) + " (was face=" +
-                    std::to_string(faceBeforeDisconnect_) + ", rollState=" +
+                    std::to_string(compareBaseline) + ", rollState=" +
                     std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
-                    ", settled count=" + std::to_string(advertSettledCount_) + ")");
+                    ", settled count=" + std::to_string(advertSettledCount_) +
+                    (isReadyPath ? ", ready-path)" : ")"));
 
-                faceBeforeDisconnect_ = advFace;
-                rollStateBeforeDisconnect_ = advRollState;
+                if (!isReadyPath)
+                {
+                    faceBeforeDisconnect_ = advFace;
+                    rollStateBeforeDisconnect_ = advRollState;
+                }
                 advertSettledFace_ = 0;
                 advertSettledCount_ = 0;
                 reportFace = advFace;

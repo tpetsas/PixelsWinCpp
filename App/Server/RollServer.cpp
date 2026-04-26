@@ -597,15 +597,29 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                     ? "" : pendingRequest_.collectedLabels[0];
                 auto requestStartedAt = pendingRequest_.startedAt;
                 int fallbackFace = 0;
+                std::string fallbackLabelSuffix = "fallback";
 
-                lock.unlock();
-                if (snapshotProvider_)
+                // Helper lambda that runs P1/P2/P3 against a snapshot vector.
+                // Returns the face if any priority matched, else 0. Also captures
+                // wasRollingAtDisconnect / currentFace from the missing die for the
+                // caller to inspect (set unconditionally even on a hit).
+                auto tryAdvertFallbacks = [&](const std::vector<DieStatusSnapshot>& snaps,
+                                              bool& outMissingDieWasRolling,
+                                              int& outMissingDieFace,
+                                              std::string& outMissingDieLabel) -> int
                 {
-                    auto snapshots = snapshotProvider_();
-                    for (const auto& s : snapshots)
+                    outMissingDieWasRolling = false;
+                    outMissingDieFace = 0;
+                    outMissingDieLabel.clear();
+
+                    for (const auto& s : snaps)
                     {
                         if (s.label == reportedLabel)
                             continue;
+
+                        outMissingDieWasRolling = s.wasRollingAtDisconnect;
+                        outMissingDieFace = s.currentFace;
+                        outMissingDieLabel = s.label;
 
                         // Priority 1: advert debounce has reached the threshold for this
                         // disconnect event. advertSettledFace resets after each advert-reported
@@ -614,12 +628,11 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                         if (s.advertSettledFace > 0 &&
                             s.advertSettledCount >= DieConnection::kAdvertSettledThreshold)
                         {
-                            fallbackFace = s.advertSettledFace;
-                            log("[RollServer] Fallback: using " + s.label +
-                                " advertSettledFace=" + std::to_string(fallbackFace) +
+                            log("[RollServer] Fallback (P1-debounced-advert): using " + s.label +
+                                " advertSettledFace=" + std::to_string(s.advertSettledFace) +
                                 " (count=" + std::to_string(s.advertSettledCount) + "/" +
                                 std::to_string(DieConnection::kAdvertSettledThreshold) + ")");
-                            break;
+                            return s.advertSettledFace;
                         }
 
                         // Priority 2: last confirmed roll face — only if it happened
@@ -627,28 +640,244 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                         if (!s.recentRollFaces.empty() && s.hasLastRoll &&
                             s.lastRollAt >= requestStartedAt)
                         {
-                            fallbackFace = s.recentRollFaces.back();
-                            log("[RollServer] Fallback: using " + s.label +
-                                " recentRollFace=" + std::to_string(fallbackFace));
-                            break;
+                            log("[RollServer] Fallback (P2-recentRollFace): using " + s.label +
+                                " recentRollFace=" + std::to_string(s.recentRollFaces.back()));
+                            return s.recentRollFaces.back();
                         }
 
-                        // Priority 3 (stale currentFace) intentionally removed.
-                        // A stale face produces a plausible-looking wrong result that BG3 cannot
-                        // detect. A timeout is always preferable to a silent wrong answer.
-                        log("[RollServer] Fallback: " + s.label +
-                            " — no reliable face available (currentFace=" +
-                            std::to_string(s.currentFace) +
-                            (s.wasRollingAtDisconnect ? ", was rolling at disconnect" : "") +
-                            "); will timeout");
+                        // Priority 3: single advert below the normal debounce threshold.
+                        // By the time this fallback runs (~18s total), rolling is long over.
+                        // The 2-packet debounce guards against mid-tumble false positives during
+                        // active rolling — irrelevant here. One advert at timeout is reliable.
+                        if (s.advertSettledFace > 0)
+                        {
+                            log("[RollServer] Fallback (P3-single-advert): using " + s.label +
+                                " advertSettledFace=" + std::to_string(s.advertSettledFace) +
+                                " (count=" + std::to_string(s.advertSettledCount) + "/" +
+                                std::to_string(DieConnection::kAdvertSettledThreshold) +
+                                " — below threshold but accepted at timeout)");
+                            return s.advertSettledFace;
+                        }
+
+                        break;  // only consider the first non-reporting die
                     }
+                    return 0;
+                };
+
+                bool missingDieWasRolling = false;
+                int missingDieFace = 0;
+                std::string missingDieLabel;
+
+                // First pass: P1/P2/P3 with current snapshot data.
+                lock.unlock();
+                if (snapshotProvider_)
+                {
+                    auto snapshots = snapshotProvider_();
+                    fallbackFace = tryAdvertFallbacks(
+                        snapshots, missingDieWasRolling, missingDieFace, missingDieLabel);
                 }
                 lock.lock();
 
-                if (fallbackFace > 0)
+                if (fallbackFace == 0)
+                {
+                    if (!missingDieWasRolling && missingDieFace > 0)
+                    {
+                        // Die was idle at disconnect — currentFace is the last GATT-reported
+                        // settled face (or post-roll face from a brief reconnect). Safe to use.
+                        fallbackFace = missingDieFace;
+                        log("[RollServer] Fallback (P4-currentFace): using " + missingDieLabel +
+                            " currentFace=" + std::to_string(fallbackFace) +
+                            " (last known settled face — die was not rolling at disconnect)");
+                    }
+                    else if (missingDieWasRolling)
+                    {
+                        // Die was mid-tumble at disconnect: currentFace is known stale.
+                        // Run an extension wait — Windows BLE may suppress adverts from a
+                        // freshly-disconnected device for 10-20+ seconds. A polling window
+                        // converts a wrong stale face into the correct settled face once
+                        // the OS finally lets adverts through.
+                        // (Session 10 Fix 2: widened from 4s to 8s — observed advert
+                        // suppression up to ~19s post-disconnect in real sessions, exceeding
+                        // the prior 15s + 4s = 19s budget. 15s + 8s = 23s catches more.)
+                        static constexpr auto kExtensionWindow = std::chrono::seconds(8);
+                        const auto extDeadline = std::chrono::steady_clock::now() + kExtensionWindow;
+
+                        log("[RollServer] Extension wait: " + missingDieLabel +
+                            " was rolling at disconnect (currentFace=" +
+                            std::to_string(missingDieFace) +
+                            " is stale); waiting up to 8s for advert data");
+
+                        // Refresh reconnect suspension so the watchdog doesn't start
+                        // reconnecting and blocking adverts during the critical extension.
+                        if (reconnectSuspender_)
+                        {
+                            lock.unlock();
+                            reconnectSuspender_(std::chrono::duration_cast<std::chrono::seconds>(
+                                kExtensionWindow + std::chrono::seconds(1)));
+                            lock.lock();
+                        }
+
+                        bool gotAnyResult = false;
+                        while (running_ && !gotAnyResult &&
+                               std::chrono::steady_clock::now() < extDeadline)
+                        {
+                            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                extDeadline - std::chrono::steady_clock::now());
+                            const auto slice = std::min(remaining, std::chrono::milliseconds(500));
+
+                            // Wait briefly on rollCv_ in case advert path fires markRollResult.
+                            const bool gotRoll = rollCv_.wait_for(lock, slice, [this]()
+                            {
+                                return pendingRequest_.collectedRolls.size() >= 2 || !running_;
+                            });
+
+                            if (!running_) break;
+
+                            if (gotRoll && pendingRequest_.collectedRolls.size() >= 2)
+                            {
+                                // Roll arrived via rollCv_ — second die was already added.
+                                log("[RollServer] Extension wait: roll arrived via rollCv_");
+                                gotAnyResult = true;
+                                gotSecond = true;
+                                break;
+                            }
+
+                            // Re-poll the snapshot for advert data.
+                            if (snapshotProvider_)
+                            {
+                                lock.unlock();
+                                auto snaps = snapshotProvider_();
+                                int extFace = tryAdvertFallbacks(
+                                    snaps, missingDieWasRolling, missingDieFace, missingDieLabel);
+                                lock.lock();
+
+                                if (pendingRequest_.collectedRolls.size() >= 2)
+                                {
+                                    // rollCv_ raced with us; roll was already added
+                                    gotAnyResult = true;
+                                    gotSecond = true;
+                                    break;
+                                }
+                                if (extFace > 0)
+                                {
+                                    fallbackFace = extFace;
+                                    fallbackLabelSuffix = "fallback-extension";
+                                    gotAnyResult = true;
+                                    log("[RollServer] Extension wait: advert data arrived, using face=" +
+                                        std::to_string(fallbackFace));
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!running_)
+                        {
+                            pendingRequest_.active = false;
+                            return "{\"error\": \"server stopping\"}";
+                        }
+
+                        // Session 11: extension yielded no advert data. Before falling back to
+                        // the stale P4 currentFace, lift the reconnect suspension so the
+                        // watchdog can immediately reconnect the missing die. A successful
+                        // GATT reconnect triggers checkMissedRoll, which calls
+                        // onRoll(missingDieLabel, settledFace) → rollCv_.notify_all(). This
+                        // converts the wrong stale-face answer into the correct settled face
+                        // in cases where Windows BLE advert suppression outlasts the
+                        // 15s + 8s = 23s P1/P2/P3/extension budget.
+                        if (fallbackFace == 0 && !gotSecond && missingDieWasRolling)
+                        {
+                            log("[RollServer] Extension yielded no advert for " + missingDieLabel +
+                                "; lifting suspension to allow GATT reconnect + checkMissedRoll (up to 10s)");
+
+                            if (reconnectSuspender_)
+                            {
+                                lock.unlock();
+                                // Pass 0s: reconnectSuspendedUntil_ = now + 0 = now, which the
+                                // watchdog interprets as "no longer suspended" on its next tick.
+                                // immediateReconnectRequested_ was already set on disconnect, so
+                                // the watchdog fires immediately.
+                                reconnectSuspender_(std::chrono::seconds(0));
+                                lock.lock();
+                            }
+
+                            static constexpr auto kGattReconnectWindow = std::chrono::seconds(10);
+                            const auto reconnectDeadline =
+                                std::chrono::steady_clock::now() + kGattReconnectWindow;
+
+                            while (running_ && !gotSecond && fallbackFace == 0 &&
+                                   std::chrono::steady_clock::now() < reconnectDeadline)
+                            {
+                                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    reconnectDeadline - std::chrono::steady_clock::now());
+                                const auto slice = std::min(remaining, std::chrono::milliseconds(500));
+
+                                gotSecond = rollCv_.wait_for(lock, slice, [this]()
+                                {
+                                    return pendingRequest_.collectedRolls.size() >= 2 || !running_;
+                                });
+
+                                if (gotSecond || !running_) break;
+
+                                // Snapshot poll: die may have reconnected and updated currentFace
+                                // without firing onRoll (edge case). Accept if face changed from
+                                // the stale value captured at disconnect.
+                                if (snapshotProvider_ && !missingDieLabel.empty())
+                                {
+                                    lock.unlock();
+                                    auto snaps = snapshotProvider_();
+                                    lock.lock();
+
+                                    if (pendingRequest_.collectedRolls.size() >= 2)
+                                    {
+                                        gotSecond = true;
+                                        break;
+                                    }
+
+                                    for (const auto& s : snaps)
+                                    {
+                                        if (s.label != missingDieLabel) continue;
+                                        if (s.status != Systemic::Pixels::PixelStatus::Ready) continue;
+                                        if (s.currentFace > 0 && s.currentFace != missingDieFace)
+                                        {
+                                            fallbackFace = s.currentFace;
+                                            fallbackLabelSuffix = "fallback-reconnect";
+                                            log("[RollServer] GATT reconnect: " + missingDieLabel +
+                                                " reconnected, face=" + std::to_string(fallbackFace) +
+                                                " (was stale " + std::to_string(missingDieFace) + ")");
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (!running_)
+                            {
+                                pendingRequest_.active = false;
+                                return "{\"error\": \"server stopping\"}";
+                            }
+                        }
+
+                        // Extension + GATT reconnect both yielded nothing — true last resort:
+                        // stale currentFace.
+                        if (fallbackFace == 0 && !gotSecond && missingDieFace > 0)
+                        {
+                            fallbackFace = missingDieFace;
+                            log("[RollServer] Fallback (P4-currentFace): using " + missingDieLabel +
+                                " currentFace=" + std::to_string(fallbackFace) +
+                                " (uncertain — was rolling at disconnect, face may be stale; "
+                                "extension wait and GATT reconnect both yielded no data)");
+                        }
+                    }
+                }
+
+                if (gotSecond)
+                {
+                    // Roll arrived via rollCv_ during extension; nothing to push.
+                }
+                else if (fallbackFace > 0)
                 {
                     pendingRequest_.collectedRolls.push_back(fallbackFace);
-                    pendingRequest_.collectedLabels.push_back("fallback");
+                    pendingRequest_.collectedLabels.push_back(fallbackLabelSuffix);
                 }
                 else
                 {
