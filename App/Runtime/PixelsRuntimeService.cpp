@@ -3,9 +3,10 @@
 
 #include "App/DiceManager.h"
 
-PixelsRuntimeService::PixelsRuntimeService(Logger logger, StateObserver stateObserver)
+PixelsRuntimeService::PixelsRuntimeService(Logger logger, StateObserver stateObserver, RollObserver rollObserver)
     : logger_(std::move(logger)),
-      stateObserver_(std::move(stateObserver))
+      stateObserver_(std::move(stateObserver)),
+      rollObserver_(std::move(rollObserver))
 {
 }
 
@@ -39,7 +40,7 @@ bool PixelsRuntimeService::start()
         manager_.reset();
     }
 
-    manager_ = std::make_unique<DiceManager>(config_.pixelIds, logger_, stateObserver_);
+    manager_ = std::make_unique<DiceManager>(config_.pixelIds, logger_, stateObserver_, rollObserver_);
     manager_->start();
     return true;
 }
@@ -68,7 +69,7 @@ void PixelsRuntimeService::runUntilEnterPressed()
         manager_.reset();
     }
 
-    manager_ = std::make_unique<DiceManager>(config_.pixelIds, logger_, stateObserver_);
+    manager_ = std::make_unique<DiceManager>(config_.pixelIds, logger_, stateObserver_, rollObserver_);
     manager_->runUntilEnterPressed();
     manager_.reset();
 }
@@ -91,4 +92,12 @@ bool PixelsRuntimeService::isRunning() const
 bool PixelsRuntimeService::isScanning() const
 {
     return manager_ && manager_->isScanning();
+}
+
+void PixelsRuntimeService::suspendReconnects(std::chrono::seconds duration)
+{
+    if (manager_)
+    {
+        manager_->suspendReconnects(duration);
+    }
 }

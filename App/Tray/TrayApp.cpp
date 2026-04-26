@@ -168,6 +168,12 @@ TrayApp::~TrayApp()
 {
     stopSetupScan();
 
+    if (rollServer_)
+    {
+        rollServer_->stop();
+        rollServer_.reset();
+    }
+
     if (runtime_)
     {
         runtime_->stop();
@@ -254,10 +260,22 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
         appendLog(message);
     };
 
+    // Create the roll server (named pipe endpoint for BG3 mod communication)
+    rollServer_ = std::make_unique<RollServer>(logger);
+
+    // Roll observer: forward every roll event to the RollServer
+    auto rollObserver = [this](const std::string& label, int face)
+    {
+        if (rollServer_)
+        {
+            rollServer_->onRoll(label, face);
+        }
+    };
+
     runtime_ = std::make_unique<PixelsRuntimeService>(logger, [this]()
     {
         stateDirty_ = true;
-    });
+    }, rollObserver);
 
     std::string error;
     configLoaded_ = runtime_->loadConfig(narrowAscii(configPath_), error);
@@ -271,6 +289,18 @@ bool TrayApp::initialize(HINSTANCE instanceHandle, const std::wstring& configPat
     {
         MessageBoxW(windowHandle_, L"Failed to start runtime service.", L"Pixels Tray", MB_ICONERROR | MB_OK);
     }
+
+    // Start the roll server with snapshot and reconnect-suspend callbacks
+    rollServer_->start(
+        [this]() -> std::vector<DieStatusSnapshot>
+        {
+            return runtime_ ? runtime_->snapshotDice() : std::vector<DieStatusSnapshot>{};
+        },
+        [this](std::chrono::seconds duration)
+        {
+            if (runtime_) runtime_->suspendReconnects(duration);
+        }
+    );
 
     SetTimer(windowHandle_, kTooltipTimerId, 1200, nullptr);
     SetTimer(windowHandle_, kNotificationTimerId, 3000, nullptr);
@@ -366,6 +396,11 @@ LRESULT TrayApp::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_DESTROY:
         KillTimer(hwnd, kTooltipTimerId);
         KillTimer(hwnd, kNotificationTimerId);
+        if (rollServer_)
+        {
+            rollServer_->stop();
+            rollServer_.reset();
+        }
         if (runtime_)
         {
             runtime_->stop();
@@ -1528,7 +1563,10 @@ void TrayApp::writeLogToFile(const std::wstring& message)
         return;
     }
 
-    std::string narrow(message.begin(), message.end());
+    std::string narrow;
+    narrow.reserve(message.size());
+    for (wchar_t c : message)
+        narrow += static_cast<char>(c);
     logFile_ << narrow << std::endl;
 }
 

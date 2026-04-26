@@ -133,11 +133,13 @@ private:
     DieConnection* owner_;
 };
 
-DieConnection::DieConnection(uint32_t targetPixelId, std::string label, Logger logger, StateObserver stateObserver)
+DieConnection::DieConnection(uint32_t targetPixelId, std::string label, Logger logger,
+                             StateObserver stateObserver, RollObserver rollObserver)
     : targetPixelId_(targetPixelId),
       label_(std::move(label)),
       logger_(std::move(logger)),
       stateObserver_(std::move(stateObserver)),
+      rollObserver_(std::move(rollObserver)),
       delegate_(std::make_shared<Delegate>(this))
 {
 }
@@ -176,6 +178,15 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
         // even during Reconnecting — the next reconnect attempt will use fresh data
         lastScannedPixel_ = scannedPixel;
 
+        // Seed missed-roll state from advert if we've never connected via GATT.
+        // Without this, processAdvertisement() ignores all adverts because
+        // faceBeforeDisconnect_ stays 0 until the first GATT disconnect event.
+        if (faceBeforeDisconnect_ == 0)
+        {
+            faceBeforeDisconnect_ = static_cast<int>(scannedPixel->currentFace());
+            rollStateBeforeDisconnect_ = scannedPixel->rollState();
+        }
+
         if (connectionState_ == ConnectionState::Connecting ||
             connectionState_ == ConnectionState::Reconnecting)
         {
@@ -189,8 +200,10 @@ bool DieConnection::trySelectScannedPixel(const std::shared_ptr<const ScannedPix
         }
 
         // Recovery re-discovery: die was already selected but disconnected with many failures.
-        // Request immediate reconnect with the fresh ScannedPixel data.
-        if (connectionState_ == ConnectionState::Selected && pixel_ && consecutiveFailures_ >= 2)
+        // Request immediate reconnect with the fresh ScannedPixel data, but only outside
+        // a suspend window — firing during suspension defeats the advert fast-path.
+        if (connectionState_ == ConnectionState::Selected && pixel_ && consecutiveFailures_ >= 2 &&
+            std::chrono::steady_clock::now() >= reconnectSuspendedUntil_)
         {
             recoveryRediscovery = true;
             immediateReconnectRequested_.store(true);
@@ -410,29 +423,30 @@ void DieConnection::shutdown()
         setConnectionState(ConnectionState::Shutdown);
     }
 
-    // Wait for any in-progress BLE operation to finish before disconnecting
-    std::lock_guard<std::mutex> bleLock(bleOpMutex_);
+    // Try to acquire the BLE op lock with a timeout. A WinRT connect/identify
+    // call can block for many seconds; we don't want shutdown to hang the UI.
+    bool gotLock = bleOpMutex_.try_lock_for(std::chrono::seconds(3));
 
-    std::shared_ptr<Pixel> localPixel;
+    if (gotLock)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        localPixel = pixel_;
-    }
-
-    if (localPixel)
-    {
-        try
+        std::shared_ptr<Pixel> localPixel;
         {
-            localPixel->disconnect();
+            std::lock_guard<std::mutex> lock(mutex_);
+            localPixel = pixel_;
         }
-        catch (...)
+        if (localPixel)
         {
+            try { localPixel->disconnect(); } catch (...) {}
         }
+        bleOpMutex_.unlock();
     }
 
     if (connectThread_.joinable())
     {
-        connectThread_.join();
+        if (gotLock)
+            connectThread_.join();
+        else
+            connectThread_.detach();  // BLE op still in flight; abandon it
     }
 }
 
@@ -462,7 +476,7 @@ std::chrono::steady_clock::time_point DieConnection::lastSuccessfulConnect() con
 
 void DieConnection::forceReleaseConnection()
 {
-    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
     if (!bleLock.owns_lock())
     {
         log("[adapter] BLE operation in progress, cannot release");
@@ -482,6 +496,11 @@ void DieConnection::forceReleaseConnection()
                 faceBeforeDisconnect_ = localPixel->currentFace();
                 rollStateBeforeDisconnect_ = localPixel->rollState();
             }
+            // Reset advert debounce so stale counts from a previous disconnect
+            // don't contaminate the next one (bug B3 guard)
+            advertSettledFace_ = 0;
+            advertSettledCount_ = 0;
+            advertSawRolling_ = false;
             setConnectionState(ConnectionState::Selected);
             // Give this die a small backoff so the failing die gets priority
             lastConnectAttempt_ = std::chrono::steady_clock::now();
@@ -550,10 +569,15 @@ DieStatusSnapshot DieConnection::snapshot() const
     snapshot.lastRollFace = lastRollFace_;
     snapshot.lastRollAt = lastRollAt_;
     snapshot.recentRollFaces = recentRollFaces_;
+    snapshot.advertSettledFace = advertSettledFace_;
+    snapshot.advertSettledCount = advertSettledCount_;
+    snapshot.wasRollingAtDisconnect = (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                                       rollStateBeforeDisconnect_ == PixelRollState::Handling);
 
     if (pixel_)
     {
         snapshot.status = pixel_->status();
+        snapshot.rollState = pixel_->rollState();
         snapshot.batteryLevel = pixel_->batteryLevel();
         snapshot.currentFace = pixel_->currentFace();
         snapshot.isCharging = pixel_->isCharging();
@@ -649,8 +673,9 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
         std::lock_guard<std::mutex> lock(mutex_);
         savedFace = faceBeforeDisconnect_;
         savedRollState = rollStateBeforeDisconnect_;
-        faceBeforeDisconnect_ = 0;  // Reset so we don't double-count
-        rollStateBeforeDisconnect_ = PixelRollState::Unknown;
+        // Do NOT clear here — keep rollStateBeforeDisconnect_ set until after
+        // markRollResult, so that snapshot() correctly reports wasRollingAtDisconnect
+        // during the RollServer fallback window. Cleared at the end of this function.
     }
 
     if (!pixel || savedFace == 0)
@@ -674,21 +699,31 @@ void DieConnection::checkMissedRoll(const std::shared_ptr<Pixel>& pixel)
             ", rollState=" + std::to_string(static_cast<int>(savedRollState)) +
             ") -> landed on " + std::to_string(newFace) +
             " (rollState=" + std::to_string(static_cast<int>(currentRollState)) + ")");
-        markRollResult(newFace);
+        markRollResult(newFace, /*isMissedRoll=*/false);
+        // Clear after markRollResult so wasRollingAtDisconnect stays accurate in snapshot
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            faceBeforeDisconnect_ = 0;
+            rollStateBeforeDisconnect_ = PixelRollState::Unknown;
+        }
         return;
     }
 
     // Case 2: Die was at rest at disconnect time but face changed —
     // it was rolled and settled during the disconnect window.
-    // Always record as a missed roll: the post-reconnect face is authoritative,
-    // and rollState decays from OnFace to None over time, so after a prolonged
-    // disconnect any real roll will show rollState=5.
     if (!wasRolling && newFace != savedFace && isAtRest)
     {
         log("[missed-roll] Face changed from " + std::to_string(savedFace) +
             " to " + std::to_string(newFace) + " during disconnect (rollState=" +
             std::to_string(static_cast<int>(currentRollState)) + ")");
-        markRollResult(newFace);
+        markRollResult(newFace, /*isMissedRoll=*/false);
+    }
+
+    // Clear after markRollResult to prevent double-counting on next reconnect
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        faceBeforeDisconnect_ = 0;
+        rollStateBeforeDisconnect_ = PixelRollState::Unknown;
     }
 }
 
@@ -706,31 +741,68 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
     }
 
     int reportFace = 0;
+    bool reportWasRolling = false;  // Track if roll came from a genuinely rolling die
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // Only process while disconnected and waiting for reconnect
-        if (connectionState_ != ConnectionState::Selected &&
-            connectionState_ != ConnectionState::Reconnecting)
+        // Process while disconnected/reconnecting OR while still Ready: a Ready die
+        // is also broadcasting advertisements, and they let us catch a roll whose
+        // GATT onRolled notification was silently dropped by the Windows BLE stack.
+        // (Session 10 Fix 1: widen gate to include Ready.)
+        const bool isDisconnectedPath =
+            (connectionState_ == ConnectionState::Selected ||
+             connectionState_ == ConnectionState::Reconnecting);
+        const bool isReadyPath = (connectionState_ == ConnectionState::Ready);
+        if (!isDisconnectedPath && !isReadyPath)
         {
             return;
         }
 
-        // Already recovered the roll via advert (or no disconnect state saved)
-        if (faceBeforeDisconnect_ == 0)
+        // For the Ready path, use the current GATT-known face as the baseline so we
+        // can detect a face change reported only via advert. Skip if no face known.
+        int readyBaseline = 0;
+        if (isReadyPath)
         {
-            return;
+            if (!pixel_) return;
+            readyBaseline = pixel_->currentFace();
+            if (readyBaseline == 0) return;
+        }
+        else
+        {
+            // Disconnected path: original guard — already recovered the roll via advert
+            // (or no disconnect state saved). Does NOT apply to Ready path because a
+            // connected die that has never disconnected has faceBeforeDisconnect_ == 0.
+            if (faceBeforeDisconnect_ == 0)
+            {
+                return;
+            }
         }
 
         const int advFace = scannedPixel->currentFace();
         const auto advRollState = scannedPixel->rollState();
 
+        // Comparison baseline: for Ready dice, use the GATT-known current face; for
+        // disconnected dice, use the saved face from the last GATT disconnect event.
+        const int compareBaseline = isReadyPath ? readyBaseline : faceBeforeDisconnect_;
+
+        // For Ready path: if the GATT-known face has caught up to (or moved past) any
+        // previously accumulated debounce state, it means the prior roll completed via
+        // GATT and the partial counts are stale. Clear them so a new roll starts fresh.
+        if (isReadyPath && advertSettledFace_ != 0 && advertSettledFace_ == compareBaseline)
+        {
+            advertSettledFace_ = 0;
+            advertSettledCount_ = 0;
+            advertSawRolling_ = false;
+        }
+
         // Debug: log every advertisement received while waiting for recovery
         log("[advert-debug] face=" + std::to_string(advFace) +
             ", rollState=" + std::to_string(static_cast<int>(advRollState)) +
+            ", baseline=" + std::to_string(compareBaseline) +
             ", settledFace=" + std::to_string(advertSettledFace_) +
-            ", settledCount=" + std::to_string(advertSettledCount_));
+            ", settledCount=" + std::to_string(advertSettledCount_) +
+            (isReadyPath ? ", path=ready" : ", path=disc"));
 
         // Die still rolling — not settled yet, reset debounce and keep listening
         if (advRollState == PixelRollState::Rolling ||
@@ -744,54 +816,102 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
         }
 
         // Die is settled (OnFace or Crooked). Check if this is a missed roll.
+        // For Ready path, rollStateBeforeDisconnect_ is irrelevant — only the live
+        // advertSawRolling_ flag (set this request cycle) counts.
         const bool wasRolling = advertSawRolling_ ||
-                                (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
-                                 rollStateBeforeDisconnect_ == PixelRollState::Handling);
+                                (!isReadyPath &&
+                                 (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                                  rollStateBeforeDisconnect_ == PixelRollState::Handling));
 
         if (wasRolling)
         {
-            // Debounce: require consecutive settled adverts on the same face
-            // to avoid false positives from transient settle readings mid-tumble
-            if (advFace == advertSettledFace_)
+            // Fast path: the die was rolling (confirmed via GATT at disconnect, OR seen
+            // rolling in BLE advertisements), and now shows a settled face different from
+            // the pre-roll baseline. This combination is unambiguous — no stale advert
+            // can match it. Accept on a single packet; skip the 2-packet debounce.
+            // Including advertSawRolling_ covers the case where advert-recovery last
+            // updated rollStateBeforeDisconnect_ to OnFace(1), but this roll cycle the
+            // die was visibly rolling in adverts before settling.
+            // Exclude Crooked(4): that state means the die is not properly settled.
+            const bool unambiguousSettle =
+                ((!isReadyPath &&
+                  (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
+                   rollStateBeforeDisconnect_ == PixelRollState::Handling)) ||
+                 advertSawRolling_) &&
+                advRollState != PixelRollState::Crooked &&
+                advFace != compareBaseline;
+
+            if (unambiguousSettle)
             {
-                advertSettledCount_++;
-                log("[advert-debug] Same face, count now " + std::to_string(advertSettledCount_));
+                log("[advert-recovery] Fast-path settle: rolling->settled face=" +
+                    std::to_string(advFace) + " (was face=" +
+                    std::to_string(compareBaseline) + ", advRollState=" +
+                    std::to_string(static_cast<int>(advRollState)) +
+                    (isReadyPath ? ", ready-path)" : ")"));
+                if (!isReadyPath)
+                {
+                    // Disconnected-path bookkeeping only — Ready path leaves these alone
+                    faceBeforeDisconnect_ = advFace;
+                    rollStateBeforeDisconnect_ = advRollState;
+                }
+                advertSettledFace_ = 0;
+                advertSettledCount_ = 0;
+                advertSawRolling_ = false;
+                reportFace = advFace;
+                reportWasRolling = true;
             }
             else
             {
-                advertSettledFace_ = advFace;
-                advertSettledCount_ = 1;
-                log("[advert-debug] Face changed to " + std::to_string(advFace) + ", reset count to 1");
+                // Slow path: require consecutive settled adverts on the same face.
+                // Used when: face matches tumble face (ambiguous), Crooked state,
+                // or only advertSawRolling_ is set (die was at rest at disconnect).
+                if (advFace == advertSettledFace_)
+                {
+                    advertSettledCount_++;
+                    log("[advert-debug] Same face, count now " + std::to_string(advertSettledCount_));
+                }
+                else
+                {
+                    advertSettledFace_ = advFace;
+                    advertSettledCount_ = 1;
+                    log("[advert-debug] Face changed to " + std::to_string(advFace) + ", reset count to 1");
+                }
+
+                if (advertSettledCount_ < kAdvertSettledThreshold)
+                {
+                    log("[advert-debug] Waiting for " + std::to_string(kAdvertSettledThreshold) + " consecutive, have " + std::to_string(advertSettledCount_));
+                    return;
+                }
+
+                log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
+                    std::to_string(advFace) + " (was face=" +
+                    std::to_string(compareBaseline) + ", rollState=" +
+                    std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
+                    ", settled count=" + std::to_string(advertSettledCount_) +
+                    (isReadyPath ? ", ready-path)" : ")"));
+
+                if (!isReadyPath)
+                {
+                    faceBeforeDisconnect_ = advFace;
+                    rollStateBeforeDisconnect_ = advRollState;
+                }
+                advertSettledFace_ = 0;
+                advertSettledCount_ = 0;
+                advertSawRolling_ = false;
+                reportFace = advFace;
+                reportWasRolling = true;
             }
-
-            if (advertSettledCount_ < kAdvertSettledThreshold)
-            {
-                log("[advert-debug] Waiting for " + std::to_string(kAdvertSettledThreshold) + " consecutive, have " + std::to_string(advertSettledCount_));
-                return;
-            }
-
-            log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
-                std::to_string(advFace) + " (was face=" +
-                std::to_string(faceBeforeDisconnect_) + ", rollState=" +
-                std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
-                ", settled count=" + std::to_string(advertSettledCount_) + ")");
-
-            // Keep monitoring: set to recovered face so further changes are detected
-            faceBeforeDisconnect_ = advFace;
-            rollStateBeforeDisconnect_ = advRollState;
-            advertSettledFace_ = 0;
-            advertSettledCount_ = 0;
-            advertSawRolling_ = false;
-            reportFace = advFace;
         }
-        else if (advFace != faceBeforeDisconnect_)
+        else if (advFace != compareBaseline)
         {
-            // Face changed while die was at rest. Only consider OnFace/Crooked as
-            // potential rolls — rollState=None(5) means just moved/handled.
-            // Apply debouncing here too: advertisement data can show stale rollState
-            // values, so a single advert should never trigger a roll report.
-            if (advRollState == PixelRollState::OnFace ||
-                advRollState == PixelRollState::Crooked)
+            // Face changed while die was at rest. Accept any non-rolling state —
+            // this includes rollState=5 (firmware idle, not in C++ SDK enum) which
+            // is the normal post-roll settled state reported by current Pixel firmware.
+            const bool isSettledState =
+                (advRollState != PixelRollState::Rolling &&
+                 advRollState != PixelRollState::Handling);
+
+            if (isSettledState)
             {
                 if (advFace == advertSettledFace_)
                 {
@@ -813,35 +933,39 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
 
                 log("[advert-recovery] Roll detected via advertisement (debounced): face=" +
                     std::to_string(advFace) + " (was face=" +
-                    std::to_string(faceBeforeDisconnect_) + ", rollState=" +
+                    std::to_string(compareBaseline) + ", rollState=" +
                     std::to_string(static_cast<int>(rollStateBeforeDisconnect_)) +
-                    ", settled count=" + std::to_string(advertSettledCount_) + ")");
+                    ", settled count=" + std::to_string(advertSettledCount_) +
+                    (isReadyPath ? ", ready-path)" : ")"));
 
-                faceBeforeDisconnect_ = advFace;
-                rollStateBeforeDisconnect_ = advRollState;
+                if (!isReadyPath)
+                {
+                    faceBeforeDisconnect_ = advFace;
+                    rollStateBeforeDisconnect_ = advRollState;
+                }
                 advertSettledFace_ = 0;
                 advertSettledCount_ = 0;
                 reportFace = advFace;
+                reportWasRolling = true;
             }
             else
             {
                 log("[advert-debug] Face changed to " + std::to_string(advFace) +
                     " (rollState=" + std::to_string(static_cast<int>(advRollState)) +
-                    ") — not a roll, tracking only");
+                    ") — still in motion, tracking only");
             }
         }
     }
 
-    // markRollResult acquires mutex_ internally, must call outside the lock
     if (reportFace > 0)
     {
-        markRollResult(reportFace);
+        markRollResult(reportFace, /*isMissedRoll=*/!reportWasRolling);
     }
 }
 
 bool DieConnection::reconnectPixel()
 {
-    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
     if (!bleLock.owns_lock())
     {
         log("[reconnect] BLE operation already in progress, skipping");
@@ -869,6 +993,7 @@ bool DieConnection::reconnectPixel()
     static constexpr int kRetryDelaySeconds = 2;
 
     bool ok = false;
+    bool suspendedBySuspend = false;
     for (int attempt = 0; attempt < kReconnectRetries && !ok; ++attempt)
     {
         if (attempt == 0)
@@ -886,6 +1011,14 @@ bool DieConnection::reconnectPixel()
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (shuttingDown_) return false;
+            // Honor suspend window mid-retry: RollServer may have issued a suspend
+            // after we started this loop. Abort so the scanner gets a clear channel.
+            if (std::chrono::steady_clock::now() < reconnectSuspendedUntil_)
+            {
+                log("[reconnect] Suspended mid-retry, aborting reconnect loop");
+                suspendedBySuspend = true;
+                break;
+            }
         }
 
         try
@@ -927,7 +1060,16 @@ bool DieConnection::reconnectPixel()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            if (suspendedBySuspend)
+            {
+                // Voluntary abort: decay failure count so the die stays in the lighter
+                // reconnectPixel path rather than escalating to reconstructiveReconnect
+                consecutiveFailures_ = std::max(0, consecutiveFailures_ - 1);
+            }
+            else
+            {
+                consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            }
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
@@ -940,7 +1082,7 @@ bool DieConnection::reconnectPixel()
 
 bool DieConnection::reconstructiveReconnect()
 {
-    std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+    std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
     if (!bleLock.owns_lock())
     {
         log("[reconstructive] BLE operation already in progress, skipping");
@@ -983,27 +1125,48 @@ bool DieConnection::reconstructiveReconnect()
     // Also allow the advertisement scanner to receive adverts from this die
     // for missed-roll recovery (the die can only advertise when no connection
     // attempt is active).
-    log("[reconstructive] Waiting 3s for BLE cleanup + advertisement scan window...");
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-
+    log("[reconstructive] Waiting up to 3s for BLE cleanup + advertisement scan window...");
+    bool suspendedBySuspend = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (shuttingDown_) return false;
-        // Re-read ScannedPixel — scanner may have received fresh data during the wait
-        if (lastScannedPixel_)
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline)
         {
-            scannedPixel = lastScannedPixel_;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (shuttingDown_) return false;
+                if (std::chrono::steady_clock::now() < reconnectSuspendedUntil_)
+                {
+                    log("[reconstructive] Suspend detected during cleanup wait, aborting");
+                    suspendedBySuspend = true;
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
     }
 
-    // Create new Pixel from stored ScannedPixel data
-    auto newPixel = Pixel::create(*scannedPixel, delegate_);
-
+    std::shared_ptr<Pixel> newPixel;
+    if (!suspendedBySuspend)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pixel_ = newPixel;
-        lastAnyMessage_ = std::chrono::steady_clock::now();
-        lastRollEvent_ = lastAnyMessage_;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (shuttingDown_) return false;
+            // Re-read ScannedPixel — scanner may have received fresh data during the wait
+            if (lastScannedPixel_)
+            {
+                scannedPixel = lastScannedPixel_;
+            }
+        }
+
+        // Create new Pixel from stored ScannedPixel data
+        newPixel = Pixel::create(*scannedPixel, delegate_);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pixel_ = newPixel;
+            lastAnyMessage_ = std::chrono::steady_clock::now();
+            lastRollEvent_ = lastAnyMessage_;
+        }
     }
 
     // Retry loop: try up to 3 times with 2s delays, same as reconnectPixel.
@@ -1011,7 +1174,7 @@ bool DieConnection::reconstructiveReconnect()
     static constexpr int kReconstructiveRetryDelaySeconds = 2;
 
     bool ok = false;
-    for (int attempt = 0; attempt < kReconstructiveRetries && !ok; ++attempt)
+    for (int attempt = 0; attempt < kReconstructiveRetries && !ok && !suspendedBySuspend; ++attempt)
     {
         if (attempt > 0)
         {
@@ -1024,6 +1187,13 @@ bool DieConnection::reconstructiveReconnect()
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (shuttingDown_) return false;
+            // Honor suspend window mid-retry (see reconnectPixel for rationale)
+            if (std::chrono::steady_clock::now() < reconnectSuspendedUntil_)
+            {
+                log("[reconstructive] Suspended mid-retry, aborting reconnect loop");
+                suspendedBySuspend = true;
+                break;
+            }
         }
 
         try
@@ -1069,7 +1239,16 @@ bool DieConnection::reconstructiveReconnect()
         else
         {
             setConnectionState(ConnectionState::Selected);
-            consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            if (suspendedBySuspend)
+            {
+                // Voluntary abort: decay failure count so the die stays in the lighter
+                // reconnectPixel path rather than escalating further
+                consecutiveFailures_ = std::max(0, consecutiveFailures_ - 1);
+            }
+            else
+            {
+                consecutiveFailures_ = std::min(consecutiveFailures_ + 1, 10);
+            }
         }
         lastAnyMessage_ = std::chrono::steady_clock::now();
         lastRollEvent_ = lastAnyMessage_;
@@ -1089,7 +1268,7 @@ void DieConnection::startConnectThread()
 
     connectThread_ = std::thread([this]()
     {
-        std::unique_lock<std::mutex> bleLock(bleOpMutex_, std::try_to_lock);
+        std::unique_lock<std::timed_mutex> bleLock(bleOpMutex_, std::try_to_lock);
         if (!bleLock.owns_lock())
         {
             log("[connect] BLE operation already in progress, skipping");
@@ -1160,7 +1339,7 @@ void DieConnection::markRollEvent()
     lastAnyMessage_ = lastRollEvent_;
 }
 
-void DieConnection::markRollResult(int face)
+void DieConnection::markRollResult(int face, bool isMissedRoll)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1174,6 +1353,12 @@ void DieConnection::markRollResult(int face)
         }
     }
     notifyStateChanged();
+    // Only notify the roll server for real physical rolls, not missed-roll
+    // recovery after reconnect (those are face-change artifacts, not real rolls)
+    if (rollObserver_ && !isMissedRoll)
+    {
+        rollObserver_(label_, face);
+    }
 }
 
 void DieConnection::notifyStateChanged() const

@@ -32,8 +32,10 @@ class DieConnection
 public:
     using Logger = std::function<void(const std::string&)>;
     using StateObserver = std::function<void()>;
+    using RollObserver = std::function<void(const std::string& label, int face)>;
 
-    DieConnection(uint32_t targetPixelId, std::string label, Logger logger, StateObserver stateObserver = nullptr);
+    DieConnection(uint32_t targetPixelId, std::string label, Logger logger,
+                  StateObserver stateObserver = nullptr, RollObserver rollObserver = nullptr);
     ~DieConnection();
 
     DieConnection(const DieConnection&) = delete;
@@ -64,6 +66,8 @@ public:
     void requestPriorityReconnect();
     void suspendReconnectUntil(std::chrono::steady_clock::time_point until);
 
+    static constexpr int kAdvertSettledThreshold = 2;  // 2 consecutive settled adverts (~300-400ms)
+
 private:
     class Delegate;
 
@@ -75,7 +79,7 @@ private:
     void startConnectThread();
     void markAnyMessage();
     void markRollEvent();
-    void markRollResult(int face);
+    void markRollResult(int face, bool isMissedRoll = false);
     void notifyStateChanged() const;
     void setConnectionState(ConnectionState newState);
 
@@ -85,12 +89,13 @@ private:
     static const char* connectionStateToString(ConnectionState state);
 
     mutable std::mutex mutex_;
-    std::mutex bleOpMutex_;  // Serializes BLE operations (connect/disconnect/reconnect)
+    std::timed_mutex bleOpMutex_;  // Serializes BLE operations (connect/disconnect/reconnect)
 
     const uint32_t targetPixelId_;
     const std::string label_;
     const Logger logger_;
     const StateObserver stateObserver_;
+    const RollObserver rollObserver_;
 
     std::shared_ptr<Systemic::Pixels::Pixel> pixel_;
     std::shared_ptr<Delegate> delegate_;
@@ -131,7 +136,6 @@ private:
     int advertSettledFace_ = 0;
     int advertSettledCount_ = 0;
     bool advertSawRolling_ = false;  // True if rolling adverts were seen during this disconnect
-    static constexpr int kAdvertSettledThreshold = 3;  // ~300-600ms at BLE advert intervals
 
     bool hasLastRoll_ = false;
     int lastRollFace_ = 0;

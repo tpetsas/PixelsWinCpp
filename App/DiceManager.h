@@ -24,8 +24,10 @@ class DiceManager
 public:
     using Logger = std::function<void(const std::string&)>;
     using StateObserver = std::function<void()>;
+    using RollObserver = std::function<void(const std::string& label, int face)>;
 
-    DiceManager(const std::vector<uint32_t>& targetPixelIds, Logger logger, StateObserver stateObserver = nullptr);
+    DiceManager(const std::vector<uint32_t>& targetPixelIds, Logger logger,
+               StateObserver stateObserver = nullptr, RollObserver rollObserver = nullptr);
     ~DiceManager();
 
     DiceManager(const DiceManager&) = delete;
@@ -38,6 +40,11 @@ public:
     void runUntilEnterPressed();
     std::vector<DieStatusSnapshot> snapshotDice() const;
     bool isScanning() const;
+
+    // Suspend watchdog reconnect attempts for all non-Ready dice for the given duration.
+    // Called by RollServer at the start of a multi-die request so the BLE scanner has
+    // a clear channel to receive advertisements from disconnected dice.
+    void suspendReconnects(std::chrono::seconds duration);
 
 private:
     void startScanner();
@@ -52,6 +59,7 @@ private:
 
     Logger logger_;
     StateObserver stateObserver_;
+    RollObserver rollObserver_;
 
     std::vector<std::unique_ptr<DieConnection>> dice_;
     std::unique_ptr<Systemic::Pixels::PixelScanner> scanner_;

@@ -305,6 +305,9 @@ namespace Systemic::Pixels
                 {
                     const auto& roll = static_cast<const Messages::RollState&>(message);
 
+                    // Save previous state before updating — needed to detect rolling→settled transitions.
+                    const PixelRollState prevState = _data.rollState;
+
                     // Update properties
                     _data.rollState = roll.state;
                     _data.currentFace = roll.faceIndex + 1;
@@ -314,7 +317,20 @@ namespace Systemic::Pixels
                         // Always notify delegate of roll events
                         _delegate->onRollStateChanged(shared_from_this(), roll.state, roll.faceIndex + 1);
 
-                        if (roll.state == PixelRollState::OnFace)
+                        // Current Pixel firmware sometimes reports the post-roll settled state as
+                        // rollState=5 (an out-of-enum "idle" value) instead of OnFace=1. Both mean
+                        // the die has landed. Treat any Rolling/Handling → settled transition as a
+                        // completed roll, mirroring the Android SDK's loose interpretation.
+                        const bool wasMoving =
+                            prevState == PixelRollState::Rolling ||
+                            prevState == PixelRollState::Handling;
+                        const bool isSettled =
+                            roll.state != PixelRollState::Rolling &&
+                            roll.state != PixelRollState::Handling &&
+                            roll.state != PixelRollState::Unknown &&
+                            roll.state != PixelRollState::Crooked;
+
+                        if (roll.state == PixelRollState::OnFace || (isSettled && wasMoving))
                         {
                             _delegate->onRolled(shared_from_this(), roll.faceIndex + 1);
                         }
