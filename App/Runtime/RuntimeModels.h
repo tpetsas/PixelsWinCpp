@@ -18,6 +18,7 @@ struct DieStatusSnapshot
     bool hasPixel = false;
 
     Systemic::Pixels::PixelStatus status = Systemic::Pixels::PixelStatus::Disconnected;
+    Systemic::Pixels::PixelRollState rollState = Systemic::Pixels::PixelRollState::Unknown;
     int batteryLevel = 0;
     int currentFace = 0;
     bool isCharging = false;

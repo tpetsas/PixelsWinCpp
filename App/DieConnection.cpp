@@ -577,6 +577,7 @@ DieStatusSnapshot DieConnection::snapshot() const
     if (pixel_)
     {
         snapshot.status = pixel_->status();
+        snapshot.rollState = pixel_->rollState();
         snapshot.batteryLevel = pixel_->batteryLevel();
         snapshot.currentFace = pixel_->currentFace();
         snapshot.isCharging = pixel_->isCharging();
@@ -785,16 +786,18 @@ void DieConnection::processAdvertisement(const std::shared_ptr<const ScannedPixe
 
         if (wasRolling)
         {
-            // Fast path: GATT confirmed the die was rolling at disconnect, and the
-            // advert now shows it settled on a DIFFERENT face in a non-ambiguous state.
-            // This combination is unambiguous — no pre-roll stale advert can match it.
-            // Accept on a single packet; skip the 2-packet debounce.
+            // Fast path: the die was rolling (confirmed via GATT at disconnect, OR seen
+            // rolling in BLE advertisements), and now shows a settled face different from
+            // the pre-roll baseline. This combination is unambiguous — no stale advert
+            // can match it. Accept on a single packet; skip the 2-packet debounce.
+            // Including advertSawRolling_ covers the case where advert-recovery last
+            // updated rollStateBeforeDisconnect_ to OnFace(1), but this roll cycle the
+            // die was visibly rolling in adverts before settling.
             // Exclude Crooked(4): that state means the die is not properly settled.
-            // rollState values beyond the enum (e.g. firmware state 5) are treated as
-            // settled and accepted here.
             const bool unambiguousSettle =
                 (rollStateBeforeDisconnect_ == PixelRollState::Rolling ||
-                 rollStateBeforeDisconnect_ == PixelRollState::Handling) &&
+                 rollStateBeforeDisconnect_ == PixelRollState::Handling ||
+                 advertSawRolling_) &&
                 advRollState != PixelRollState::Crooked &&
                 advFace != faceBeforeDisconnect_;
 

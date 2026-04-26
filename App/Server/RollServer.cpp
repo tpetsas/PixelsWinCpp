@@ -563,6 +563,8 @@ std::string RollServer::waitForRolls(const std::string& mode, uint32_t generatio
                         {
                             if (s.label != otherDieLabel) continue;
                             if (s.status != Systemic::Pixels::PixelStatus::Ready) continue;
+                            if (s.rollState == Systemic::Pixels::PixelRollState::Rolling ||
+                                s.rollState == Systemic::Pixels::PixelRollState::Handling) continue;
                             if (s.currentFace == 0 || s.currentFace == otherDiePreFace) continue;
 
                             log("[RollServer] Second-roll snapshot recovery: " + s.label +

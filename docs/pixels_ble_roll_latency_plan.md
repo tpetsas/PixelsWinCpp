@@ -1,7 +1,7 @@
 # Pixels Windows BLE Roll-Latency Stabilization Plan
 
 **Date:** 2026-04-24  
-**Last updated:** 2026-04-25 (Session 6 — kSecondRollTimeout extended past Windows BLE advert delay)  
+**Last updated:** 2026-04-25 (Session 7 — unambiguousSettle missing advertSawRolling_, snapshot accepts mid-roll face)  
 **Branch context:** `server-mode` branch, with uploaded `diff.txt` and `pixels_log-big-session.txt.txt`  
 **Primary goal:** after the user physically rolls a Pixel die, return the roll result as fast as possible, ideally within a few seconds, even when Windows BLE/GATT is flaky.
 
@@ -229,6 +229,58 @@ The advert path IS correct and would have delivered the right answer. The window
 
 - **Advantage/disadvantage timeouts at 12-13s**: should drop to near zero. The advert path was always delivering the correct answer; it just needed 3-5 more seconds.
 - **Single-die normal roll timeout (gen2 pattern, 25s)**: unaffected by this fix — those are caused by Windows BLE never showing adverts within 25s for a die with persistent "Connection error: 1" failures. This is a hardware/driver issue. The system correctly recovers the result via `checkMissedRoll` when the die eventually reconnects in a subsequent request.
+
+### ✅ Done (Session 7 — 2026-04-25, advert fast-path gap + snapshot mid-roll guard)
+
+Deep analysis of the Session 6 `pixels_log.txt` (40 rolls, 3 timeouts: disadvantage gen5/gen11/gen16) identified two root-cause bugs that survived all previous sessions.
+
+#### Two root-cause bugs identified
+
+**Bug 1 — `unambiguousSettle` ignores `advertSawRolling_` (primary cause of gen5/gen11/gen16 timeouts)**
+- `processAdvertisement` fast-path (`unambiguousSettle`) only checks `rollStateBeforeDisconnect_ ∈ {Rolling, Handling}`.
+- When advert-recovery fires at the end of a roll, it updates `rollStateBeforeDisconnect_` to `OnFace(1)` (the advert's rollState after the die has settled). This means the NEXT roll cycle starts with `rollStateBeforeDisconnect_=OnFace(1)`.
+- Log evidence (gen5): advert-recovery in gen4 set `rollStateBeforeDisconnect_=OnFace(1)`. Gen5 starts — die 2 still disconnected. Rolling advert arrives → `advertSawRolling_=true`. Settled advert arrives (face=14 ≠ faceBeforeDisconnect_=5). `unambiguousSettle` check: `rollStateBeforeDisconnect_==OnFace(1)` → FALSE → slow path (requires 2 packets) → only 1 advert before timeout.
+- Identical pattern at gen11 and gen16 (each preceded by an advert-recovery roll that reset `rollStateBeforeDisconnect_=OnFace`).
+
+**Bug 2 — Snapshot polling accepts mid-rolling face (wrong result at gen8)**
+- `DieStatusSnapshot` had no `rollState` field. The second-roll snapshot polling loop only checked `s.status != Ready` before accepting a face change as a completed roll.
+- Log evidence (gen8 line ~1589-1607): snapshot polling saw die 1 at `rollState=3 (Rolling)` with `currentFace=17`. It accepted face=17 as the result (`Second-roll snapshot recovery: die 1 face 11 -> 17`). Die 1 later settled on face=14, but the response had already been sent with wrong `die2=17`.
+- The `currentFace` field is updated by every GATT rollState message — including mid-tumble — so polling must gate on rollState being settled.
+
+#### Fixes implemented (Session 7)
+
+- **Fix 1 — Include `advertSawRolling_` in `unambiguousSettle`** (`DieConnection.cpp:processAdvertisement`):
+  - Extended the `unambiguousSettle` condition from:
+    ```cpp
+    (rollStateBeforeDisconnect_ == Rolling || rollStateBeforeDisconnect_ == Handling)
+    ```
+    to:
+    ```cpp
+    (rollStateBeforeDisconnect_ == Rolling || rollStateBeforeDisconnect_ == Handling || advertSawRolling_)
+    ```
+  - `advertSawRolling_` is set to `true` any time a Rolling/Handling advert is received during the current disconnect period.
+  - This covers the case where advert-recovery last updated `rollStateBeforeDisconnect_=OnFace(1)`, but this roll cycle the die was visibly rolling in adverts before settling. The fast-path now fires on the first settled advert instead of requiring the slow 2-packet debounce.
+  - Directly fixes gen5/gen11/gen16 timeouts.
+
+- **Fix 2a — Add `rollState` to `DieStatusSnapshot`** (`Runtime/RuntimeModels.h`):
+  - Added `Systemic::Pixels::PixelRollState rollState = Systemic::Pixels::PixelRollState::Unknown;` to the snapshot struct so RollServer's polling loop can check die state.
+
+- **Fix 2b — Populate `snapshot.rollState` from pixel** (`DieConnection.cpp::snapshot()`):
+  - Added `snapshot.rollState = pixel_->rollState();` alongside the existing `status`/`currentFace` population.
+
+- **Fix 2c — Guard snapshot polling against mid-rolling state** (`RollServer.cpp`, second-roll polling loop):
+  - Added a rollState guard between the `status != Ready` check and the `currentFace` change check:
+    ```cpp
+    if (s.rollState == Systemic::Pixels::PixelRollState::Rolling ||
+        s.rollState == Systemic::Pixels::PixelRollState::Handling) continue;
+    ```
+  - Prevents snapshot recovery from accepting a face the die was reporting while still tumbling. The polling loop will retry on the next 500ms tick and capture the true settled face.
+
+#### Expected impact after Session 7
+
+- **Disadvantage gen5/gen11/gen16-style timeouts**: should drop to near zero. The single settled advert is now accepted immediately via the fast-path once `advertSawRolling_=true`, eliminating the 2-packet deadlock that caused the timeout when only one advert arrived before the window closed.
+- **Wrong result from snapshot recovery (gen8 pattern)**: eliminated. The rollState guard ensures only truly-settled faces are accepted from the polling fallback.
+- **Overall**: with Sessions 6 + 7 combined, the main remaining timeout scenario was the advert-recovery-induced `rollStateBeforeDisconnect_=OnFace` resetting the fast-path. That gap is now closed.
 
 ### 🔵 Future work — activate if instability returns
 
